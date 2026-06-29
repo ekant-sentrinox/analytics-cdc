@@ -1,0 +1,7 @@
+.idea/
+.git/
+*.iml
+dependency-reduced-pom.xml
+# Keep only the shaded jar from target/ in the build context.
+target/*
+!target/analytics-cdc.jar
