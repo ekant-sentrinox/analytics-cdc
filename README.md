@@ -17,6 +17,41 @@ is loaded from config via `io.dazzleduck.sql.common.StartupScriptProvider`.
 
 ## Data flow
 
+**Simplest view** — the three hops, end to end:
+
+```
+┌──────────────────┐      ① read (customerId, tenantId) pairs
+│  SCCAL Spring    │◄──────────────────────────────┐
+│  server  :8080   │                                │
+│  (source of      │      ② GET /…/{objectType}/list│
+│   truth)         │─── JSON snapshot ──┐           │
+└──────────────────┘                    ▼           │
+                                ┌─────────────────────┐
+                                │  SccalReferenceSync  │
+                                │  (analytics-cdc)     │
+                                │                      │
+                                │  parse JSON          │
+                                │  → TEMP staging      │
+                                │  → dedupe by key     │
+                                │  → INSERT/UPDATE/    │
+                                │    DELETE (1 txn)    │
+                                └──────────┬───────────┘
+                                           │ ③ capture changes
+                                           ▼
+                          ┌──────────────────────────────┐
+                          │  DuckLake catalog 'ollylake'  │
+                          │                                │
+                          │  metadata → .ducklake file     │
+                          │  data     → Parquet in MinIO   │
+                          │             (s3://ollylake/)   │
+                          └────────────────────────────────┘
+```
+
+In one sentence: the SCCAL server is the source of truth → `SccalReferenceSync`
+pulls each full JSON snapshot over HTTP → diffs it against the DuckLake reference
+tables → writes inserts/updates/deletes as Parquet in MinIO, tracked by the
+`.ducklake` metadata file.
+
 **At a glance** — where the data comes from and where it lands:
 
 ```
