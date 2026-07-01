@@ -2,14 +2,12 @@ package ai.sentrinox;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
-import io.dazzleduck.sql.common.StartupScriptProvider;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -211,24 +209,36 @@ public final class SccalReferenceSync {
             List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER = 3")
     );
 
+    // Derived purely from SYNCS / GLOBAL_TYPES, so computed once rather than per
+    // capture cycle. objectType -> the sync(s) it feeds (RULE feeds two), in
+    // declared order. Must be declared after SYNCS so static init sees it set.
+    private static final Map<String, List<Sync>> SYNCS_BY_TYPE = groupByType();
+    private static final List<String> GLOBAL_FETCH_TYPES =
+        SYNCS_BY_TYPE.keySet().stream().filter(GLOBAL_TYPES::contains).toList();
+    private static final List<String> TENANT_FETCH_TYPES =
+        SYNCS_BY_TYPE.keySet().stream().filter(t -> !GLOBAL_TYPES.contains(t)).toList();
+
+    private static Map<String, List<Sync>> groupByType() {
+        Map<String, List<Sync>> byType = new LinkedHashMap<>();
+        for (Sync s : SYNCS) {
+            byType.computeIfAbsent(s.objectType(), k -> new ArrayList<>()).add(s);
+        }
+        return byType;
+    }
+
     public static void main(String[] args) throws Exception {
         Config config = ConfigFactory.load().getConfig("analytics_cdc");
         String baseUrl = trimSlash(config.getString("sccal_base_url"));
         Duration pollInterval = config.getDuration("poll_interval");
-        // INSTALL/LOAD extensions, CREATE SECRET and ATTACH the DuckLake catalog.
-        String startupScript = StartupScriptProvider.load(config).getStartupScript();
 
         System.out.println("SCCAL reference sync — API: " + baseUrl);
 
         HttpClient http = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
 
-        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+        // Bootstrap once (extensions + S3 secret + ATTACH); the warm connection is
+        // reused across every cycle.
+        try (Connection conn = SqlScripts.bootstrap(config);
              Statement st = conn.createStatement()) {
-
-            // Bootstrap once; the warm connection is reused across every cycle.
-            for (String stmt : splitStatements(startupScript)) {
-                st.execute(stmt);
-            }
 
             if (isOneShot(pollInterval)) {
                 runOnce(conn, st, http, baseUrl);          // one-shot (default)
@@ -302,27 +312,19 @@ public final class SccalReferenceSync {
     /** Fetch every object type and stage its rows; globals once, tenant types per pair. */
     private static void stageAll(Connection conn, Statement st, HttpClient http,
                                  String baseUrl, List<long[]> pairs) throws SQLException {
-        // objectType -> the sync(s) it feeds (RULE feeds two), preserving declared order.
-        Map<String, List<Sync>> byType = new LinkedHashMap<>();
-        for (Sync s : SYNCS) {
-            byType.computeIfAbsent(s.objectType(), k -> new ArrayList<>()).add(s);
-        }
-        List<String> globalTypes = byType.keySet().stream().filter(GLOBAL_TYPES::contains).toList();
-        List<String> tenantTypes = byType.keySet().stream().filter(t -> !GLOBAL_TYPES.contains(t)).toList();
-
         for (Sync s : SYNCS) {
             st.execute("DROP TABLE IF EXISTS " + s.stage());
             st.execute(s.createTempSql());
         }
 
         // Global types ignore tenant scoping — fetch once (params still required).
-        if (!globalTypes.isEmpty()) {
+        if (!GLOBAL_FETCH_TYPES.isEmpty()) {
             long[] any = pairs.get(0);
-            stageResponses(conn, byType, fetchAll(http, baseUrl, globalTypes, any[0], any[1]));
+            stageResponses(conn, SYNCS_BY_TYPE, fetchAll(http, baseUrl, GLOBAL_FETCH_TYPES, any[0], any[1]));
         }
         // Tenant-scoped types — fetched concurrently for each pair.
         for (long[] pair : pairs) {
-            stageResponses(conn, byType, fetchAll(http, baseUrl, tenantTypes, pair[0], pair[1]));
+            stageResponses(conn, SYNCS_BY_TYPE, fetchAll(http, baseUrl, TENANT_FETCH_TYPES, pair[0], pair[1]));
         }
     }
 

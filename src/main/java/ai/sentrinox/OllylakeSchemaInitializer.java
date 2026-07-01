@@ -2,13 +2,11 @@ package ai.sentrinox;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
-import io.dazzleduck.sql.common.StartupScriptProvider;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
-import java.sql.DriverManager;
 import java.sql.Statement;
 import java.util.Comparator;
 import java.util.List;
@@ -31,14 +29,9 @@ public final class OllylakeSchemaInitializer {
         // INSTALL/LOAD the DuckLake + S3 extensions, CREATE the MinIO secret and
         // ATTACH the catalog — all from the shared startup script in the config.
         Config config = ConfigFactory.load().getConfig("analytics_cdc");
-        String startupScript = StartupScriptProvider.load(config).getStartupScript();
 
-        try (Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+        try (Connection conn = SqlScripts.bootstrap(config);
              Statement st = conn.createStatement()) {
-
-            for (String stmt : SqlScripts.splitStatements(startupScript)) {
-                st.execute(stmt);
-            }
 
             for (Path file : sqlFiles(initDir)) {
                 System.out.println("-- applying " + file.getFileName());
