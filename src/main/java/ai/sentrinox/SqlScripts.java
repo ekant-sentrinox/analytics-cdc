@@ -1,10 +1,40 @@
 package ai.sentrinox;
 
+import com.typesafe.config.Config;
+import io.dazzleduck.sql.common.StartupScriptProvider;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
 /** Helpers for working with multi-statement SQL scripts. */
 final class SqlScripts {
+
+    /**
+     * Open an in-memory DuckDB connection and run the config's startup script —
+     * INSTALL/LOAD the DuckLake + S3 extensions, CREATE the MinIO secret and
+     * ATTACH the catalog. Both entry points ({@link OllylakeSchemaInitializer}
+     * and {@link SccalReferenceSync}) share this exact bootstrap.
+     *
+     * <p>The connection is returned open for the caller to use and close. If the
+     * startup script fails the connection is closed before the error propagates,
+     * so it never leaks.
+     */
+    static Connection bootstrap(Config config) throws Exception {
+        String startupScript = StartupScriptProvider.load(config).getStartupScript();
+        Connection conn = DriverManager.getConnection("jdbc:duckdb:");
+        try (Statement st = conn.createStatement()) {
+            for (String stmt : splitStatements(startupScript)) {
+                st.execute(stmt);
+            }
+        } catch (RuntimeException | java.sql.SQLException e) {
+            conn.close();
+            throw e;
+        }
+        return conn;
+    }
 
     /**
      * Split a multi-statement SQL script into individual statements.
