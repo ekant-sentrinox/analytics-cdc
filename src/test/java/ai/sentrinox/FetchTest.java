@@ -3,21 +3,19 @@ package ai.sentrinox;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /**
  * Mockito tests for {@link SccalReferenceSync#fetchAll}: request shape, the
@@ -25,21 +23,12 @@ import static org.mockito.Mockito.when;
  */
 class FetchTest {
 
-    @SuppressWarnings("unchecked")
     private static HttpResponse<String> response(int status, String body) {
-        HttpResponse<String> resp = mock(HttpResponse.class);
-        when(resp.statusCode()).thenReturn(status);
-        when(resp.body()).thenReturn(body);
-        when(resp.uri()).thenReturn(java.net.URI.create("http://stub/x"));
-        return resp;
+        return TestSupport.response(status, body, URI.create("http://stub/x"));
     }
 
-    @SuppressWarnings("unchecked")
     private static HttpClient clientReturning(HttpResponse<String> resp) {
-        HttpClient http = mock(HttpClient.class);
-        when(http.sendAsync(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
-            .thenReturn(CompletableFuture.completedFuture(resp));
-        return http;
+        return TestSupport.httpStub(req -> resp);
     }
 
     @Test

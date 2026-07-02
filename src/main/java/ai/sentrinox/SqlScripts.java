@@ -5,6 +5,7 @@ import io.dazzleduck.sql.common.StartupScriptProvider;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,8 +20,8 @@ final class SqlScripts {
      * and {@link SccalReferenceSync}) share this exact bootstrap.
      *
      * <p>The connection is returned open for the caller to use and close. If the
-     * startup script fails the connection is closed before the error propagates,
-     * so it never leaks.
+     * startup script fails the connection is closed before the error propagates
+     * (a close failure is attached as suppressed), so it never leaks.
      */
     static Connection bootstrap(Config config) throws Exception {
         String startupScript = StartupScriptProvider.load(config).getStartupScript();
@@ -29,11 +30,52 @@ final class SqlScripts {
             for (String stmt : splitStatements(startupScript)) {
                 st.execute(stmt);
             }
-        } catch (RuntimeException | java.sql.SQLException e) {
-            conn.close();
+            return conn;
+        } catch (Throwable e) {
+            try {
+                conn.close();
+            } catch (Exception closeError) {
+                e.addSuppressed(closeError);
+            }
             throw e;
         }
-        return conn;
+    }
+
+    /** Body of a lake transaction; returns true to commit, false to roll back. */
+    interface TxnBody {
+        boolean run() throws SQLException;
+    }
+
+    /**
+     * Run {@code body} in a transaction on {@code conn}: autoCommit off, commit
+     * or roll back per the body's return value, roll back on a throw, and always
+     * restore autoCommit. The one home for the scaffold the snapshot capture,
+     * change-stream apply and resync paths all share.
+     */
+    static void inTransaction(Connection conn, TxnBody body) throws SQLException {
+        conn.setAutoCommit(false);
+        try {
+            if (body.run()) {
+                conn.commit();
+            } else {
+                conn.rollback();
+            }
+        } catch (SQLException | RuntimeException e) {
+            try {
+                conn.rollback();
+            } catch (SQLException ignored) {
+                // Connection unusable — the original error propagates.
+            }
+            try {
+                conn.setAutoCommit(true);
+            } catch (SQLException suppressed) {
+                // A restore failure on a dead connection must not replace the
+                // original error (a bare finally would) — attach it instead.
+                e.addSuppressed(suppressed);
+            }
+            throw e;
+        }
+        conn.setAutoCommit(true);
     }
 
     /**

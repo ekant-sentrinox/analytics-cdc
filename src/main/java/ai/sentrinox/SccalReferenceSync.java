@@ -2,25 +2,23 @@ package ai.sentrinox;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
-import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.function.Function;
 
 /**
@@ -53,9 +51,9 @@ import java.util.function.Function;
  */
 public final class SccalReferenceSync {
 
-    private static final String API_PATH = "/internal/sccal/api/v1/";
-    private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(10);
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
+    private static final Logger log = LoggerFactory.getLogger(SccalReferenceSync.class);
+
+    static final String API_PATH = "/internal/sccal/api/v1/";
 
     /**
      * Object types that ignore tenant scoping — fetched once (with the first
@@ -100,7 +98,11 @@ public final class SccalReferenceSync {
 
         /** Temp staging table name, unique per target table. */
         private String stage() {
-            return "cdc_stg_" + table.replaceAll("[^A-Za-z0-9]", "_");
+            return stageName("cdc_stg_");
+        }
+
+        private String stageName(String prefix) {
+            return prefix + table.replaceAll("[^A-Za-z0-9]", "_");
         }
 
         /** {@code t.k1 = s.k1 AND t.k2 = s.k2} for the staging-vs-target key match. */
@@ -108,9 +110,18 @@ public final class SccalReferenceSync {
             return join(keyCols, c -> "t." + c.column() + " = s." + c.column(), " AND ");
         }
 
+        /** {@code col1 TYPE1, col2 TYPE2} column DDL for a staging table. */
+        private String columnDefs() {
+            return join(allCols(), c -> c.column() + " " + c.sqlType(), ", ");
+        }
+
+        /** {@code d1 = s.d1, d2 = s.d2} SET clause over the data columns. */
+        private String setClause() {
+            return join(dataCols, c -> c.column() + " = s." + c.column(), ", ");
+        }
+
         private String createTempSql() {
-            return "CREATE TEMP TABLE " + stage() + " ("
-                + join(allCols(), c -> c.column() + " " + c.sqlType(), ", ") + ")";
+            return "CREATE TEMP TABLE " + stage() + " (" + columnDefs() + ")";
         }
 
         /** Parameterised: bind the raw JSON response as parameter 1. */
@@ -142,8 +153,7 @@ public final class SccalReferenceSync {
         }
 
         String updateSql() {
-            String set = join(dataCols, c -> c.column() + " = s." + c.column(), ", ");
-            return "UPDATE " + table + " t SET " + set + " FROM " + stage() + " s WHERE "
+            return "UPDATE " + table + " t SET " + setClause() + " FROM " + stage() + " s WHERE "
                 + keyEq() + " AND (" + changedPredicate() + ")";
         }
 
@@ -157,6 +167,114 @@ public final class SccalReferenceSync {
             return join(dataCols, c -> "t." + c.column() + " IS DISTINCT FROM s." + c.column(), " OR ");
         }
 
+        // ---- change-stream variants ------------------------------------------
+        // Fed from a /changes page (entity-change stream) instead of a snapshot.
+        // Deletes are explicit tombstones (action = 'DELETE'), never inferred
+        // from absence, so none of the snapshot path's empty-stage guarding is
+        // needed here.
+
+        /** Temp staging table for /changes entries, unique per target table. */
+        String changeStage() {
+            return stageName("cdc_chg_");
+        }
+
+        String createChangeStageSql() {
+            return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " (" + columnDefs()
+                + ", __action VARCHAR, __change_id BIGINT)";
+        }
+
+        /**
+         * Parameterised: bind one raw /changes response body as parameter 1.
+         * Stages the page's entries of {@code entityType}, pulling the columns
+         * out of each entry's {@code sccal} payload — aliased {@code e}, so
+         * {@link Col#expr()} and {@link #filter} apply unchanged.
+         *
+         * <p>Two guards align this with the snapshot path's delete semantics:
+         * a non-DELETE action whose payload says {@code isDeleted:true} (a
+         * soft-delete modelled as an update) is normalised to a tombstone, and
+         * tombstones bypass {@link #filter} — a minimal DELETE payload may omit
+         * the filter field, and a NULL predicate would silently drop the delete.
+         * Deleting by key is safe for a sibling table the entity doesn't live
+         * in: the key simply matches nothing there.
+         */
+        String stageChangesSql(String entityType) {
+            String sql = "INSERT INTO " + changeStage() + " (" + columns(allCols())
+                + ", __action, __change_id) SELECT " + join(allCols(), Col::expr, ", ")
+                + ", __action, __change_id FROM ("
+                + "SELECT entry->'sccal' AS e,"
+                + " CASE WHEN coalesce((entry->'sccal'->>'isDeleted')::BOOLEAN, false)"
+                + " THEN 'DELETE' ELSE entry->>'action' END AS __action,"
+                + " (entry->>'id')::BIGINT AS __change_id"
+                + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS entry)"
+                + " WHERE entry->>'entityType' = '" + entityType + "')";
+            return filter == null ? sql : sql + " WHERE (__action = 'DELETE' OR " + filter + ")";
+        }
+
+        /**
+         * Collapse to the LAST event per key (highest change id) — a page can
+         * carry several events for one key (e.g. CREATE then DELETE) and only
+         * the final state may be applied.
+         */
+        String changeDedupeSql() {
+            return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " AS SELECT * FROM " + changeStage()
+                + " QUALIFY row_number() OVER (PARTITION BY " + columns(keyCols)
+                + " ORDER BY __change_id DESC) = 1";
+        }
+
+        String changeDeleteSql() {
+            return "DELETE FROM " + table + " t WHERE EXISTS (SELECT 1 FROM " + changeStage()
+                + " s WHERE " + keyEq() + " AND s.__action = 'DELETE')";
+        }
+
+        String changeUpdateSql() {
+            return "UPDATE " + table + " t SET " + setClause() + " FROM " + changeStage() + " s WHERE "
+                + keyEq() + " AND s.__action <> 'DELETE' AND " + notNull(dataCols)
+                + " AND (" + changedPredicate() + ")";
+        }
+
+        String changeInsertSql() {
+            String cols = columns(allCols());
+            return "INSERT INTO " + table + " (" + cols + ") SELECT " + cols + " FROM " + changeStage()
+                + " s WHERE s.__action <> 'DELETE' AND " + notNull(allCols()) + " AND NOT EXISTS "
+                + "(SELECT 1 FROM " + table + " t WHERE " + keyEq() + ")";
+        }
+
+        /** {@code s.c1 IS NOT NULL AND s.c2 IS NOT NULL} over the given columns. */
+        private String notNull(List<Col> cols) {
+            return join(cols, c -> "s." + c.column() + " IS NOT NULL", " AND ");
+        }
+
+        /**
+         * Apply one staged /changes page (dedupe, then DELETE / UPDATE / INSERT);
+         * returns {inserted, updated, deleted}. Replays are idempotent: a re-seen
+         * CREATE hits NOT EXISTS, a re-seen UPDATE fails the changed predicate,
+         * a re-seen DELETE matches nothing.
+         *
+         * <p>Non-tombstone rows with a NULL column are counted, warned about and
+         * skipped (the NOT NULL guards in the insert/update SQL): applying one
+         * would violate the target's NOT NULL constraints, abort the whole
+         * transaction with the cursor unmoved, and refail on the same page every
+         * cycle — a single poison entry must not freeze the stream.
+         */
+        int[] applyChanges(Statement st) throws SQLException {
+            st.execute(changeDedupeSql());
+            int skipped = countUnappliable(st);
+            if (skipped > 0) {
+                log.warn("change stream: {} {} event(s) skipped — payload missing a required"
+                    + " column (entry preserved in the audit log)", skipped, displayName());
+            }
+            return applyDml(st, false, changeDeleteSql(), changeUpdateSql(), changeInsertSql());
+        }
+
+        /** Staged non-tombstone rows with a NULL column: not insertable/updatable. */
+        private int countUnappliable(Statement st) throws SQLException {
+            try (ResultSet rs = st.executeQuery("SELECT count(*) FROM " + changeStage()
+                + " s WHERE s.__action <> 'DELETE' AND NOT (" + notNull(allCols()) + ")")) {
+                rs.next();
+                return rs.getInt(1);
+            }
+        }
+
         /** Apply DELETE / UPDATE / INSERT; returns {inserted, updated, deleted}. */
         private int[] merge(Statement st) throws SQLException {
             // An empty staging table is ambiguous: it can mean "this type genuinely
@@ -164,9 +282,19 @@ public final class SccalReferenceSync {
             // body" (coalesced to "{}") or "every pair failed". Treating that as a
             // delete would wipe the whole target table on a transient hiccup, so
             // skip DELETE when staging is empty and leave the existing rows intact.
-            int deleted = stageIsEmpty(st) ? 0 : st.executeUpdate(deleteSql());
-            int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(updateSql());
-            int inserted = st.executeUpdate(insertSql());
+            return applyDml(st, stageIsEmpty(st), deleteSql(), updateSql(), insertSql());
+        }
+
+        /**
+         * The shared apply sequence of both capture paths; returns
+         * {inserted, updated, deleted} — the order every totals consumer assumes.
+         * UPDATE is skipped for edge tables (no data columns to change).
+         */
+        private int[] applyDml(Statement st, boolean skipDelete, String delete, String update,
+                               String insert) throws SQLException {
+            int deleted = skipDelete ? 0 : st.executeUpdate(delete);
+            int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(update);
+            int inserted = st.executeUpdate(insert);
             return new int[] {inserted, updated, deleted};
         }
 
@@ -182,8 +310,10 @@ public final class SccalReferenceSync {
         }
     }
 
-    // The seven reference tables and the object type each is captured from.
-    // RULE feeds two tables, split by ruleType (1 = provider/LLM, 3 = MCP).
+    // The reference tables and the object type each is captured from.
+    // RULE feeds two tables, split by the ruleType enum: 0 = TenantProvider /
+    // 1 = WorkspaceProvider are LLM/provider access rules, 2 = TenantMcp /
+    // 3 = WorkspaceMcp are MCP access rules (tenant vs. workspace scope).
     static final List<Sync> SYNCS = List.of(
         new Sync("workspace", "ollylake.main.workspace",
             List.of(new Col("workspace_id", "workspaceId", "BIGINT")),
@@ -203,24 +333,38 @@ public final class SccalReferenceSync {
             List.of(new Col("name", "name", "VARCHAR")), null),
         new Sync("rule", "ollylake.main.llm_access_rule",
             List.of(new Col("llm_access_rule_id", "ruleId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER = 1"),
+            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER IN (0, 1)"),
         new Sync("rule", "ollylake.main.mcp_access_rule",
             List.of(new Col("mcp_access_rule_id", "ruleId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER = 3")
+            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER IN (2, 3)")
     );
 
-    // Derived purely from SYNCS / GLOBAL_TYPES, so computed once rather than per
-    // capture cycle. objectType -> the sync(s) it feeds (RULE feeds two), in
-    // declared order. Must be declared after SYNCS so static init sees it set.
-    private static final Map<String, List<Sync>> SYNCS_BY_TYPE = groupByType();
-    private static final List<String> GLOBAL_FETCH_TYPES =
-        SYNCS_BY_TYPE.keySet().stream().filter(GLOBAL_TYPES::contains).toList();
-    private static final List<String> TENANT_FETCH_TYPES =
-        SYNCS_BY_TYPE.keySet().stream().filter(t -> !GLOBAL_TYPES.contains(t)).toList();
+    /**
+     * Object types now fed from the entity-change stream ({@code /changes})
+     * instead of the per-cycle full-snapshot diff: snapshot-API objectType →
+     * the {@code /changes} entityType that feeds it (the stream emits enum
+     * names, the snapshot API path segments). The SINGLE source of truth for
+     * the stream/snapshot split — {@link #STREAM_SYNCS}, {@link #SNAPSHOT_SYNCS}
+     * and {@link ChangeStreamSync#SYNCS_BY_ENTITY_TYPE} all derive from it, so
+     * promoting a type to the stream is one entry here. Grows as SCCAL wires
+     * more capture types (USER + ACTIVATION today; ACTIVATION feeds no
+     * reference table). The snapshot machinery still covers these types on
+     * bootstrap and on a 410 Gone resync — see {@link ChangeStreamSync}.
+     */
+    static final Map<String, String> STREAM_ENTITY_TYPES = Map.of("user", "USER");
 
-    private static Map<String, List<Sync>> groupByType() {
+    /** Stream-fed syncs (bootstrap / resync scope). Declared after SYNCS. */
+    static final List<Sync> STREAM_SYNCS = SYNCS.stream()
+        .filter(s -> STREAM_ENTITY_TYPES.containsKey(s.objectType())).toList();
+
+    /** Syncs still captured by snapshot diff every cycle. */
+    static final List<Sync> SNAPSHOT_SYNCS = SYNCS.stream()
+        .filter(s -> !STREAM_ENTITY_TYPES.containsKey(s.objectType())).toList();
+
+    /** objectType -> the sync(s) it feeds (RULE feeds two), in declared order. */
+    private static Map<String, List<Sync>> groupByType(List<Sync> syncs) {
         Map<String, List<Sync>> byType = new LinkedHashMap<>();
-        for (Sync s : SYNCS) {
+        for (Sync s : syncs) {
             byType.computeIfAbsent(s.objectType(), k -> new ArrayList<>()).add(s);
         }
         return byType;
@@ -231,9 +375,9 @@ public final class SccalReferenceSync {
         String baseUrl = trimSlash(config.getString("sccal_base_url"));
         Duration pollInterval = config.getDuration("poll_interval");
 
-        System.out.println("SCCAL reference sync — API: " + baseUrl);
+        log.info("SCCAL reference sync — API: {}", baseUrl);
 
-        HttpClient http = HttpClient.newBuilder().connectTimeout(CONNECT_TIMEOUT).build();
+        HttpClient http = SccalHttp.newClient();
 
         // Bootstrap once (extensions + S3 secret + ATTACH); the warm connection is
         // reused across every cycle.
@@ -241,8 +385,8 @@ public final class SccalReferenceSync {
              Statement st = conn.createStatement()) {
 
             if (isOneShot(pollInterval)) {
-                runOnce(conn, st, http, baseUrl);          // one-shot (default)
-                System.out.println("\nSCCAL reference sync complete.");
+                runOnce(conn, st, http, baseUrl);          // one-shot
+                log.info("SCCAL reference sync complete.");
             } else {
                 poll(conn, st, http, baseUrl, pollInterval);
             }
@@ -257,9 +401,9 @@ public final class SccalReferenceSync {
     /** Repeatedly capture on a fixed interval, surviving per-cycle failures. */
     private static void poll(Connection conn, Statement st, HttpClient http,
                              String baseUrl, Duration interval) throws InterruptedException {
-        System.out.println("Polling every " + interval.toSeconds() + "s (Ctrl-C to stop).");
+        log.info("Polling every {}s (Ctrl-C to stop).", interval.toSeconds());
         while (true) {
-            System.out.println("\n--- sync @ " + LocalTime.now().withNano(0) + " ---");
+            log.info("--- sync cycle ---");
             pollCycle(conn, st, http, baseUrl);
             Thread.sleep(interval.toMillis());
         }
@@ -274,7 +418,7 @@ public final class SccalReferenceSync {
         try {
             runOnce(conn, st, http, baseUrl);
         } catch (Exception e) {
-            System.err.println("sync cycle failed: " + e + " — retrying next interval");
+            log.error("sync cycle failed — retrying next interval", e);
             // The failure (or a throw from applyCapture's finally) may have left
             // the connection mid-transaction with autoCommit still false. Reset it
             // so this stale state can't leak into the next cycle's staging writes.
@@ -296,82 +440,144 @@ public final class SccalReferenceSync {
         }
     }
 
-    /** One full capture pass: read pairs, fetch + stage, then merge. */
+    /**
+     * One full capture pass, two phases:
+     * <ol>
+     *   <li><b>change stream</b> — stream-fed types via {@code /cursors}
+     *       discovery + per-tenant {@code /changes} deltas (usually a single
+     *       cheap idle call);</li>
+     *   <li><b>snapshot diff</b> — every other type, fetched in full and
+     *       diffed, exactly as before.</li>
+     * </ol>
+     */
     static void runOnce(Connection conn, Statement st, HttpClient http,
                         String baseUrl) throws SQLException {
         List<long[]> pairs = readCustomerTenantPairs(st);
         if (pairs.isEmpty()) {
-            System.out.println("No (customerId, tenantId) pairs in "
-                + "customer_tenant_reference — nothing to capture.");
+            log.info("No (customerId, tenantId) pairs in customer_tenant_reference"
+                + " — nothing to capture.");
             return;
         }
-        stageAll(conn, st, http, baseUrl, pairs);
-        applyCapture(conn, st);
+        // The phases are independent (disjoint tables, separate transactions):
+        // a stream failure — endpoint down, pruned offset, missing audit table —
+        // must never block snapshot capture for the other dimension tables. But
+        // it must still SURFACE after the snapshot phase: the stream-fed tables
+        // have no snapshot fallback in steady state, so a swallowed persistent
+        // failure would leave them silently stale — and let a one-shot run
+        // (cron/CI) exit 0 with monitoring none the wiser.
+        Exception streamFailure = null;
+        try {
+            ChangeStreamSync.run(conn, st, http, baseUrl, pairs);
+        } catch (SQLException | RuntimeException e) {
+            log.warn("change stream phase failed — continuing with the snapshot phase", e);
+            resetConnection(conn);
+            streamFailure = e;
+        }
+        stageAll(conn, st, http, baseUrl, pairs, SNAPSHOT_SYNCS);
+        applyCapture(conn, st, SNAPSHOT_SYNCS);
+        if (streamFailure != null) {
+            throw new IllegalStateException(
+                "change stream phase failed (snapshot phase completed)", streamFailure);
+        }
     }
 
-    /** Fetch every object type and stage its rows; globals once, tenant types per pair. */
-    private static void stageAll(Connection conn, Statement st, HttpClient http,
-                                 String baseUrl, List<long[]> pairs) throws SQLException {
-        for (Sync s : SYNCS) {
+    /**
+     * Fetch the given syncs' object types and stage their rows; globals once,
+     * tenant types per pair. Returns the total number of rows staged — zero
+     * means every response was empty or degenerate, which the resync path uses
+     * to withhold cursor seeding.
+     */
+    static long stageAll(Connection conn, Statement st, HttpClient http,
+                         String baseUrl, List<long[]> pairs, List<Sync> syncs) throws SQLException {
+        Map<String, List<Sync>> byType = groupByType(syncs);
+        List<String> globalTypes = byType.keySet().stream().filter(GLOBAL_TYPES::contains).toList();
+        List<String> tenantTypes = byType.keySet().stream().filter(t -> !GLOBAL_TYPES.contains(t)).toList();
+
+        for (Sync s : syncs) {
             st.execute("DROP TABLE IF EXISTS " + s.stage());
             st.execute(s.createTempSql());
         }
 
+        long staged = 0;
         // Global types ignore tenant scoping — fetch once (params still required).
-        if (!GLOBAL_FETCH_TYPES.isEmpty()) {
+        if (!globalTypes.isEmpty()) {
             long[] any = pairs.get(0);
-            stageResponses(conn, SYNCS_BY_TYPE, fetchAll(http, baseUrl, GLOBAL_FETCH_TYPES, any[0], any[1]));
+            staged += stageResponses(conn, byType, fetchAll(http, baseUrl, globalTypes, any[0], any[1]));
         }
         // Tenant-scoped types — fetched concurrently for each pair.
-        for (long[] pair : pairs) {
-            stageResponses(conn, SYNCS_BY_TYPE, fetchAll(http, baseUrl, TENANT_FETCH_TYPES, pair[0], pair[1]));
-        }
-    }
-
-    private static void stageResponses(Connection conn, Map<String, List<Sync>> byType,
-                                       Map<String, String> responses) throws SQLException {
-        for (Map.Entry<String, String> e : responses.entrySet()) {
-            for (Sync s : byType.get(e.getKey())) {
-                stage(conn, s, e.getValue());
+        if (!tenantTypes.isEmpty()) {
+            for (long[] pair : pairs) {
+                staged += stageResponses(conn, byType, fetchAll(http, baseUrl, tenantTypes, pair[0], pair[1]));
             }
         }
+        return staged;
+    }
+
+    /** Parse each JSON map (via DuckDB) and append its active rows to the fed stage tables. */
+    private static long stageResponses(Connection conn, Map<String, List<Sync>> byType,
+                                       Map<String, String> responses) throws SQLException {
+        long staged = 0;
+        for (Map.Entry<String, String> e : responses.entrySet()) {
+            for (Sync s : byType.get(e.getKey())) {
+                staged += DuckJson.executeWithJson(conn, s.stageSql(), e.getValue());
+            }
+        }
+        return staged;
     }
 
     /** De-dupe staging, then merge every table inside one transaction (atomic snapshot). */
-    private static void applyCapture(Connection conn, Statement st) throws SQLException {
-        for (Sync s : SYNCS) {
+    private static void applyCapture(Connection conn, Statement st, List<Sync> syncs) throws SQLException {
+        printCaptureHeader();
+        try {
+            SqlScripts.inTransaction(conn, () -> {
+                int[] totals = mergeAll(st, syncs);
+                printCaptureTotals(totals);
+                // Nothing changed → roll back so we don't write an empty DuckLake snapshot.
+                return totals[0] + totals[1] + totals[2] > 0;
+            });
+        } finally {
+            dropStages(st, syncs);
+        }
+    }
+
+    /**
+     * De-dupe each stage then merge it; prints one row per table and returns
+     * {ins, upd, del} totals. No transaction management — the caller owns the
+     * transaction (so cursor-state writes can join it).
+     */
+    static int[] mergeAll(Statement st, List<Sync> syncs) throws SQLException {
+        for (Sync s : syncs) {
             st.execute(s.dedupeSql());
         }
+        int[] totals = new int[3];
+        for (Sync s : syncs) {
+            int[] c = s.merge(st);
+            addCounts(totals, c);
+            log.info(String.format("%-28s %7d %7d %7d", s.displayName(), c[0], c[1], c[2]));
+        }
+        return totals;
+    }
 
-        System.out.printf("%n%-28s %7s %7s %7s%n", "table", "ins", "upd", "del");
-        System.out.println("-".repeat(52));
+    /** Accumulate {ins, upd, del} deltas into the running totals, in place. */
+    static void addCounts(int[] totals, int[] delta) {
+        for (int i = 0; i < delta.length; i++) {
+            totals[i] += delta[i];
+        }
+    }
 
-        conn.setAutoCommit(false);
-        try {
-            int totalIns = 0, totalUpd = 0, totalDel = 0;
-            for (Sync s : SYNCS) {
-                int[] c = s.merge(st);
-                totalIns += c[0];
-                totalUpd += c[1];
-                totalDel += c[2];
-                System.out.printf("%-28s %7d %7d %7d%n", s.displayName(), c[0], c[1], c[2]);
-            }
-            // Nothing changed → roll back so we don't write an empty DuckLake snapshot.
-            if (totalIns + totalUpd + totalDel > 0) {
-                conn.commit();
-            } else {
-                conn.rollback();
-            }
-            System.out.println("-".repeat(52));
-            System.out.printf("%-28s %7d %7d %7d%n", "TOTAL", totalIns, totalUpd, totalDel);
-        } catch (SQLException e) {
-            conn.rollback();
-            throw e;
-        } finally {
-            conn.setAutoCommit(true);
-            for (Sync s : SYNCS) {
-                st.execute("DROP TABLE IF EXISTS " + s.stage());
-            }
+    static void printCaptureHeader() {
+        log.info(String.format("%-28s %7s %7s %7s", "table", "ins", "upd", "del"));
+        log.info("-".repeat(52));
+    }
+
+    static void printCaptureTotals(int[] totals) {
+        log.info("-".repeat(52));
+        log.info(String.format("%-28s %7d %7d %7d", "TOTAL", totals[0], totals[1], totals[2]));
+    }
+
+    static void dropStages(Statement st, List<Sync> syncs) throws SQLException {
+        for (Sync s : syncs) {
+            st.execute("DROP TABLE IF EXISTS " + s.stage());
         }
     }
 
@@ -387,18 +593,9 @@ public final class SccalReferenceSync {
         }
         Map<String, String> bodies = new LinkedHashMap<>();
         for (Map.Entry<String, CompletableFuture<HttpResponse<String>>> e : inflight.entrySet()) {
-            HttpResponse<String> resp;
-            try {
-                resp = e.getValue().join();
-            } catch (CompletionException ce) {
-                throw new RuntimeException("fetch failed for " + e.getKey()
-                    + " (customerId=" + customerId + ", tenantId=" + tenantId + ")", ce.getCause());
-            }
-            if (resp.statusCode() != 200) {
-                throw new IllegalStateException("GET " + resp.uri() + " -> HTTP " + resp.statusCode());
-            }
-            String body = resp.body();
-            bodies.put(e.getKey(), (body == null || body.isBlank()) ? "{}" : body);
+            HttpResponse<String> resp = SccalHttp.join(e.getValue(), "fetch failed for "
+                + e.getKey() + " (customerId=" + customerId + ", tenantId=" + tenantId + ")");
+            bodies.put(e.getKey(), SccalHttp.requireOk(resp));
         }
         return bodies;
     }
@@ -406,23 +603,8 @@ public final class SccalReferenceSync {
     private static HttpRequest request(String baseUrl, String objectType,
                                        long customerId, long tenantId) {
         // customerId/tenantId are numeric ids, so no URL-encoding is needed.
-        String url = baseUrl + API_PATH + objectType + "/list"
-            + "?customerId=" + customerId + "&tenantId=" + tenantId;
-        return HttpRequest.newBuilder(URI.create(url))
-            .timeout(REQUEST_TIMEOUT)
-            .header("Accept", "application/json")
-            .GET()
-            .build();
-    }
-
-    // ---- staging -------------------------------------------------------------
-
-    /** Parse the JSON map (via DuckDB) and append active rows to the stage table. */
-    private static void stage(Connection conn, Sync s, String json) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(s.stageSql())) {
-            ps.setString(1, json);
-            ps.executeUpdate();
-        }
+        return SccalHttp.jsonGet(baseUrl + API_PATH + objectType + "/list"
+            + "?customerId=" + customerId + "&tenantId=" + tenantId);
     }
 
     // INVARIANT: this set of pairs defines the capture scope. Because absence from
@@ -460,11 +642,6 @@ public final class SccalReferenceSync {
 
     private static String trimSlash(String url) {
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-    }
-
-    /** Split a multi-statement SQL script into statements (see {@link SqlScripts}). */
-    static List<String> splitStatements(String sql) {
-        return SqlScripts.splitStatements(sql);
     }
 
     private SccalReferenceSync() {

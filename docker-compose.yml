@@ -92,8 +92,8 @@ services:
       STARTUP_SQL: /config/startup.sql      # consumed by StartupScriptProvider
       # Overrides sccal_base_url in application.conf.
       SCCAL_BASE_URL: ${SCCAL_BASE_URL:-http://host.docker.internal:8080}
-      # 0 = one-shot (default); set e.g. 30s or "5 minutes" to poll continuously.
-      POLL_INTERVAL: ${POLL_INTERVAL:-0}
+      # Poll continuously (e.g. 30s, 1m, "5 minutes"); 0 = run once and exit.
+      POLL_INTERVAL: ${POLL_INTERVAL:-1m}
     entrypoint: ["java", "-cp", "/app/app.jar", "ai.sentrinox.SccalReferenceSync"]
     volumes:
       - ./ollylake/startup.sql:/config/startup.sql:ro

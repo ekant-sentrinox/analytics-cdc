@@ -32,11 +32,11 @@ class PollSelectionTest {
     }
 
     @Test
-    void defaultConfigValueIsOneShot() {
-        // The shipped default (poll_interval = 0) must select one-shot.
+    void defaultConfigValuePolls() {
+        // The shipped default (poll_interval = 1m) keeps the poll loop alive.
         Duration shipped = ConfigFactory.load().getConfig("analytics_cdc").getDuration("poll_interval");
-        assertTrue(SccalReferenceSync.isOneShot(shipped),
-            "default poll_interval should run once and exit");
+        assertFalse(SccalReferenceSync.isOneShot(shipped),
+            "default poll_interval should keep polling");
     }
 
     @Test

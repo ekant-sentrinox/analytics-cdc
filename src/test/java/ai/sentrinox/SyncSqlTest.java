@@ -35,10 +35,12 @@ SyncSqlTest {
 
     @Test
     void ruleSyncsAppendTheirRuleTypeFilter() {
+        // ruleType enum: 0 = TenantProvider, 1 = WorkspaceProvider (both LLM),
+        // 2 = TenantMcp, 3 = WorkspaceMcp (both MCP).
         assertTrue(sync("ollylake.main.llm_access_rule").stageSql()
-            .endsWith("AND (e->>'ruleType')::INTEGER = 1"));
+            .endsWith("AND (e->>'ruleType')::INTEGER IN (0, 1)"));
         assertTrue(sync("ollylake.main.mcp_access_rule").stageSql()
-            .endsWith("AND (e->>'ruleType')::INTEGER = 3"));
+            .endsWith("AND (e->>'ruleType')::INTEGER IN (2, 3)"));
     }
 
     @Test
