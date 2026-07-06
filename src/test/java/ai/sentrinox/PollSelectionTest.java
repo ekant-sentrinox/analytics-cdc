@@ -16,12 +16,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class PollSelectionTest {
 
     @Test
-    void zeroIntervalIsOneShot() {
+    void nonPositiveIntervalIsOneShot() {
+        // Zero (the default) and any negative interval both mean run-once.
         assertTrue(SccalReferenceSync.isOneShot(Duration.ZERO));
-    }
-
-    @Test
-    void negativeIntervalIsOneShot() {
         assertTrue(SccalReferenceSync.isOneShot(Duration.ofSeconds(-5)));
     }
 
@@ -32,17 +29,10 @@ class PollSelectionTest {
     }
 
     @Test
-    void defaultConfigValueIsOneShot() {
-        // The shipped default (poll_interval = 0) must select one-shot.
+    void defaultConfigValuePolls() {
+        // The shipped default (poll_interval = 1m) keeps the poll loop alive.
         Duration shipped = ConfigFactory.load().getConfig("analytics_cdc").getDuration("poll_interval");
-        assertTrue(SccalReferenceSync.isOneShot(shipped),
-            "default poll_interval should run once and exit");
-    }
-
-    @Test
-    void hoconDurationStringPolls() {
-        // A configured "5 minutes" parses to a positive duration → polling.
-        Duration configured = ConfigFactory.parseString("d = 5 minutes").getDuration("d");
-        assertFalse(SccalReferenceSync.isOneShot(configured));
+        assertFalse(SccalReferenceSync.isOneShot(shipped),
+            "default poll_interval should keep polling");
     }
 }

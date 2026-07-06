@@ -2,6 +2,8 @@ package ai.sentrinox;
 
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -17,11 +19,13 @@ import java.util.stream.Stream;
  * JDBC driver.
  *
  * <p>Connects to an in-memory DuckDB, attaches a DuckLake catalog named
- * {@code ollylake} whose data files live in MinIO (S3) and whose metadata is a
- * persisted {@code .ducklake} file, then runs every {@code .sql} file in the
+ * {@code ollylake} whose data files live in MinIO (S3) and whose metadata lives
+ * in the PostgreSQL metadata-db, then runs every {@code .sql} file in the
  * init directory in lexical order.
  */
 public final class OllylakeSchemaInitializer {
+
+    private static final Logger log = LoggerFactory.getLogger(OllylakeSchemaInitializer.class);
 
     public static void main(String[] args) throws Exception {
         Path initDir = Paths.get(env("INIT_DIR", "/init"));
@@ -34,14 +38,14 @@ public final class OllylakeSchemaInitializer {
              Statement st = conn.createStatement()) {
 
             for (Path file : sqlFiles(initDir)) {
-                System.out.println("-- applying " + file.getFileName());
+                log.info("applying {}", file.getFileName());
                 for (String stmt : SqlScripts.splitStatements(Files.readString(file))) {
                     st.execute(stmt);
                 }
             }
         }
 
-        System.out.println("ollylake tables created.");
+        log.info("ollylake tables created.");
     }
 
     private static List<Path> sqlFiles(Path dir) throws Exception {
