@@ -19,8 +19,8 @@ import java.util.stream.Stream;
  * JDBC driver.
  *
  * <p>Connects to an in-memory DuckDB, attaches a DuckLake catalog named
- * {@code ollylake} whose data files live in MinIO (S3) and whose metadata is a
- * persisted {@code .ducklake} file, then runs every {@code .sql} file in the
+ * {@code ollylake} whose data files live in MinIO (S3) and whose metadata lives
+ * in the PostgreSQL metadata-db, then runs every {@code .sql} file in the
  * init directory in lexical order.
  */
 public final class OllylakeSchemaInitializer {

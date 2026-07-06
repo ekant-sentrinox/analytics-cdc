@@ -4,6 +4,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * DuckDB-as-JSON-parser helpers. Raw API bodies are bound as a {@code JSON}
@@ -12,6 +14,16 @@ import java.sql.SQLException;
  * statement goes through here.
  */
 final class DuckJson {
+
+    /** Maps one result row to a value; used by {@link #queryAll}. */
+    @FunctionalInterface
+    interface RowMapper<T> {
+        T map(ResultSet rs) throws SQLException;
+    }
+
+    /** The offset-paging fields every SCCAL page carries. See {@link #extractPage}. */
+    record Page(long nextOffset, boolean hasMore) {
+    }
 
     /** Run a DML statement whose single parameter is a raw JSON body; returns the row count. */
     static int executeWithJson(Connection conn, String sql, String json) throws SQLException {
@@ -32,28 +44,37 @@ final class DuckJson {
         }
     }
 
-    /** Top-level scalar out of a JSON body, with a fallback for absent/null. */
-    static long extractLong(Connection conn, String json, String field, long fallback)
+    /** Map every row of a query whose single parameter is a raw JSON body. */
+    static <T> List<T> queryAll(Connection conn, String sql, String json, RowMapper<T> mapper)
             throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(
-            "SELECT (?::JSON->>'" + field + "')::BIGINT")) {
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, json);
             try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                long v = rs.getLong(1);
-                return rs.wasNull() ? fallback : v;
+                List<T> rows = new ArrayList<>();
+                while (rs.next()) {
+                    rows.add(mapper.map(rs));
+                }
+                return rows;
             }
         }
     }
 
-    /** Top-level boolean out of a JSON body; absent/null reads as false. */
-    static boolean extractBool(Connection conn, String json, String field) throws SQLException {
+    /**
+     * The {@code nextOffset} (falling back to {@code fallbackOffset} when
+     * absent/null) and {@code hasMore} (false when absent/null) of a paged body —
+     * parsed in a single statement, so the body is shredded once rather than once
+     * per field.
+     */
+    static Page extractPage(Connection conn, String json, long fallbackOffset) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-            "SELECT coalesce((?::JSON->>'" + field + "')::BOOLEAN, false)")) {
-            ps.setString(1, json);
+            "SELECT coalesce((j->>'nextOffset')::BIGINT, ?),"
+                + " coalesce((j->>'hasMore')::BOOLEAN, false)"
+                + " FROM (SELECT ?::JSON AS j)")) {
+            ps.setLong(1, fallbackOffset);
+            ps.setString(2, json);
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
-                return rs.getBoolean(1);
+                return new Page(rs.getLong(1), rs.getBoolean(2));
             }
         }
     }

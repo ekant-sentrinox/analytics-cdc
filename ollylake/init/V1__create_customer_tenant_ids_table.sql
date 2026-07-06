@@ -13,9 +13,9 @@ WHERE customer_id = 322680303510360064
 
 -- Seed row. Guarded so re-running the init is idempotent.
 INSERT INTO ollylake.main.customer_tenant_reference (customer_id, tenant_id)
-SELECT 66109578638528512, 66108634651693056
+SELECT 66109578638528512, 67545582738083840
 WHERE NOT EXISTS (
     SELECT 1 FROM ollylake.main.customer_tenant_reference
     WHERE customer_id = 66109578638528512
-      AND tenant_id   = 66108634651693056
+      AND tenant_id   = 67545582738083840
 );

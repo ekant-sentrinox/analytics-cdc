@@ -26,3 +26,5 @@ CREATE TABLE IF NOT EXISTS ollylake.main.entity_change_audit (
                                                                  sccal_payload VARCHAR,           -- minimal CDC shape (JSON text)
                                                                  human_payload VARCHAR            -- full response DTO (JSON text; secret-free upstream)
 );
+ALTER TABLE ollylake.main.entity_change_audit
+    SET PARTITIONED BY (customer_id, day(changed_at));

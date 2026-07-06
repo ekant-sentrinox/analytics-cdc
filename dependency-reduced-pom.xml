@@ -94,6 +94,6 @@
     <maven.compiler.target>21</maven.compiler.target>
     <maven.compiler.source>21</maven.compiler.source>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <duckdb.version>1.4.5.0</duckdb.version>
+    <duckdb.version>1.5.4.0</duckdb.version>
   </properties>
 </project>

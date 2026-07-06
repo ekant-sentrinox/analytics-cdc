@@ -12,8 +12,6 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayDeque;
 import java.util.Deque;
-import java.util.HashMap;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -21,16 +19,17 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * End-to-end tests for the change-stream capture path ({@link ChangeStreamSync})
- * against a real in-memory DuckDB, with the three SCCAL endpoints stubbed:
- * {@code /cursors} and {@code /{objectType}/list} answer from configurable
- * state; {@code /changes} answers from a FIFO queue (so multi-page and 410
- * sequences can be scripted).
+ * against a real in-memory DuckDB, with the two SCCAL endpoints stubbed:
+ * {@code /cursors} answers from configurable state; {@code /changes} answers
+ * from a FIFO queue (so multi-page and 410 sequences can be scripted). There is
+ * no {@code /list} endpoint — every reference table is fed from the stream.
  */
 class ChangeStreamCaptureTest {
 
     private static final long CUST = 1L;
     private static final long TEN = 2L;
     private static final String USER_TABLE = "ollylake.main.\"user\"";
+    private static final String AUDIT_TABLE = "ollylake.main.entity_change_audit";
 
     private Connection conn;
     private Statement st;
@@ -40,8 +39,6 @@ class ChangeStreamCaptureTest {
     private String cursorsJson = "{}";
     /** FIFO of /changes responses: String body (HTTP 200) or Integer status. */
     private final Deque<Object> changesResponses = new ArrayDeque<>();
-    /** objectType -> snapshot JSON for /{objectType}/list. */
-    private final Map<String, String> lists = new HashMap<>();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -55,10 +52,6 @@ class ChangeStreamCaptureTest {
         st.execute("DELETE FROM ollylake.main.customer_tenant_reference");
         st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (" + CUST + ", " + TEN + ")");
 
-        // Snapshot state for every snapshot-fed type (empty) and users (2 rows).
-        lists.put("user", "{\"10\":{\"userId\":\"10\",\"userName\":\"a@x.com\"},"
-            + "\"20\":{\"userId\":\"20\",\"userName\":\"b@x.com\"}}");
-
         http = stubClient();
     }
 
@@ -71,35 +64,42 @@ class ChangeStreamCaptureTest {
     // ---- bootstrap -------------------------------------------------------------
 
     @Test
-    void bootstrapSnapshotsUsersAndSeedsCursorsFromRegistryHead() throws SQLException {
+    void bootstrapReplaysStreamAndSeedsCursors() throws SQLException {
         cursorsJson = cursorsPage(entry(5, 42), 6);
+        changesResponses.add(changesPage(43, false,
+            userChange(41, "CREATE", 10, "a@x.com", false),
+            userChange(42, "CREATE", 20, "b@x.com", false)));
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(2, count(USER_TABLE));
-        assertEquals(43, changeOffset());        // lastChangeId 42 + 1
-        assertEquals(6, registryOffset());       // the page's nextOffset
+        assertEquals(43, changeOffset());        // where the replay ended
+        assertEquals(6, registryOffset());       // full bootstrap → registry head
+        assertEquals(2, count(AUDIT_TABLE));     // the replayed entries are audited
     }
 
     @Test
-    void bootstrapWithTenantAbsentFromRegistryStartsAtOffsetOne() throws SQLException {
+    void bootstrapWithEmptyStreamSeedsOffsetOne() throws SQLException {
+        // Registry lists the pair with no changes yet; /changes returns an empty
+        // page. The bootstrap seeds the cursor at the stream start (offset 1) and
+        // captures nothing — the next cycle picks up any later changes.
         cursorsJson = "{\"entries\":[],\"nextOffset\":1,\"hasMore\":false}";
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(2, count(USER_TABLE));      // snapshot still captured
-        assertEquals(1, changeOffset());         // no registry row → replay from 1
+        assertEquals(0, count(USER_TABLE));
+        assertEquals(1, changeOffset());
+        assertEquals(1, registryOffset());
     }
 
     // ---- steady state -----------------------------------------------------------
 
     @Test
-    void idleCursorsSkipsUserSnapshotEntirely() throws SQLException {
+    void idleCursorsSkipCaptureEntirely() throws SQLException {
         bootstrap();
 
-        // Upstream user snapshot changes, but the registry reports no advance:
-        // the stream-fed table must NOT be re-snapshotted or diffed.
-        lists.put("user", "{\"99\":{\"userId\":\"99\",\"userName\":\"z@x.com\"}}");
+        // The registry reports no advance: the stream-fed tables must not be
+        // touched and the cursor must stay put.
         cursorsJson = "{\"entries\":[],\"nextOffset\":6,\"hasMore\":false}";
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
@@ -130,11 +130,11 @@ class ChangeStreamCaptureTest {
 
         // Every entry landed in the audit log — including the ACTIVATION one
         // that feeds no reference table — with both payload views.
-        assertEquals(4, count("ollylake.main.entity_change_audit"));
+        assertEquals(4, count(AUDIT_TABLE));
         try (ResultSet rs = st.executeQuery(
             "SELECT entity_type, action, commit_id,"
                 + " sccal_payload::JSON->>'userName', human_payload::JSON->>'email'"
-                + " FROM ollylake.main.entity_change_audit WHERE change_id = 44")) {
+                + " FROM " + AUDIT_TABLE + " WHERE change_id = 44")) {
             assertTrue(rs.next());
             assertEquals("USER", rs.getString(1));
             assertEquals("UPDATE", rs.getString(2));
@@ -143,7 +143,7 @@ class ChangeStreamCaptureTest {
             assertEquals("renamed@x.com", rs.getString(5));
         }
         try (ResultSet rs = st.executeQuery(
-            "SELECT action FROM ollylake.main.entity_change_audit WHERE change_id = 46")) {
+            "SELECT action FROM " + AUDIT_TABLE + " WHERE change_id = 46")) {
             assertTrue(rs.next());
             assertEquals("ACTIVATE", rs.getString(1));
         }
@@ -170,7 +170,7 @@ class ChangeStreamCaptureTest {
         bootstrap();
 
         // A deactivation modelled as an UPDATE whose payload says isDeleted:true
-        // must remove the row, matching the snapshot path's tombstone semantics.
+        // must remove the row.
         cursorsJson = cursorsPage(entry(7, 43), 8);
         changesResponses.add(changesPage(44, false,
             userChange(43, "UPDATE", 20, "b@x.com", true)));
@@ -219,49 +219,54 @@ class ChangeStreamCaptureTest {
         assertEquals(3, count(USER_TABLE));
         assertEquals("c@x.com", userName(30));
         // The replayed page must not duplicate its audit rows either.
-        assertEquals(1, count("ollylake.main.entity_change_audit"));
+        assertEquals(1, count(AUDIT_TABLE));
     }
 
     // ---- 410 Gone ----------------------------------------------------------------
 
     @Test
-    void goneFallsBackToSnapshotResyncAndFastForwards() throws SQLException {
+    void goneFastForwardsPastPrunedRange() throws SQLException {
         bootstrap();
 
         // The stream advanced far past our cursor and the low partitions were
-        // pruned: /changes answers 410. Upstream truth is now: user 10 gone,
-        // user 20 renamed — visible only via the full snapshot.
+        // pruned: /changes answers 410. With no snapshot fallback the pruned
+        // changes are lost; the cursor fast-forwards to the registry head so the
+        // stream keeps flowing.
         cursorsJson = cursorsPage(entry(9, 100), 10);
         changesResponses.add(410);
-        lists.put("user", "{\"20\":{\"userId\":\"20\",\"userName\":\"kept@x.com\"}}");
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(1, count(USER_TABLE));
-        assertEquals("kept@x.com", userName(20));
-        assertEquals(101, changeOffset());       // fast-forwarded past the pruned range
+        assertEquals(2, count(USER_TABLE));      // pruned changes not recovered
+        assertTrue(userExists(10));
+        assertTrue(userExists(20));
+        assertEquals(101, changeOffset());       // fast-forwarded to lastChangeId + 1
         assertEquals(10, registryOffset());
     }
 
     @Test
-    void goneReseedsOnlyTheAffectedPair() throws SQLException {
-        // Two tracked pairs; both bootstrap in one run.
+    void goneFastForwardsOnlyTheAffectedPair() throws SQLException {
+        // Two tracked pairs; both bootstrap in one run by replaying their streams.
         st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (3, 4)");
         cursorsJson = cursorsPage(
             entry(5, CUST, TEN, 42) + "," + entry(6, 3, 4, 50), 7);
+        changesResponses.add(changesPage(43, false,
+            userChange(41, "CREATE", 10, "a@x.com", false)));   // (CUST, TEN)
+        changesResponses.add(changesPage(51, false,
+            userChange(50, "CREATE", 99, "z@x.com", false)));   // (3, 4)
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
         assertEquals(43, changeOffsetFor(CUST, TEN));
         assertEquals(51, changeOffsetFor(3, 4));
 
-        // (CUST, TEN) advances but its saved offset was pruned: the 410 resync
-        // must reseed only that pair — the healthy pair keeps its cursor.
+        // (CUST, TEN) advances but its saved offset was pruned: only that pair's
+        // cursor fast-forwards — the healthy pair keeps its cursor.
         cursorsJson = cursorsPage(entry(8, CUST, TEN, 60), 9);
         changesResponses.add(410);
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(61, changeOffsetFor(CUST, TEN));  // fast-forwarded past the prune
+        assertEquals(61, changeOffsetFor(CUST, TEN));  // fast-forwarded to 60 + 1
         assertEquals(51, changeOffsetFor(3, 4));       // untouched
-        assertEquals(7, registryOffset());             // partial reseed leaves the registry offset
+        assertEquals(9, registryOffset());             // steady state advances the registry
     }
 
     @Test
@@ -270,21 +275,18 @@ class ChangeStreamCaptureTest {
 
         // Page 1 (offset 43) succeeds and is applied + audited; page 2 answers
         // 410. The pre-410 page must survive — cursor advanced past it and
-        // committed, audit rows kept — with the resync covering the remainder.
+        // committed, audit rows kept — with the fast-forward covering the rest.
         cursorsJson = cursorsPage(entry(7, 46), 8);
         changesResponses.add(changesPage(44, true,
             userChange(43, "CREATE", 30, "c@x.com", false)));
         changesResponses.add(410);
-        lists.put("user", "{\"10\":{\"userId\":\"10\",\"userName\":\"a@x.com\"},"
-            + "\"20\":{\"userId\":\"20\",\"userName\":\"b@x.com\"},"
-            + "\"30\":{\"userId\":\"30\",\"userName\":\"c@x.com\"}}");
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(1, count("ollylake.main.entity_change_audit"));  // page-1 audit kept
+        assertEquals(1, count(AUDIT_TABLE));     // page-1 audit kept
         assertEquals(3, count(USER_TABLE));
         assertTrue(userExists(30));
-        assertEquals(47, changeOffset());        // resync fast-forwarded past the prune
+        assertEquals(47, changeOffset());        // fast-forwarded to 46 + 1
         assertEquals(8, registryOffset());
     }
 
@@ -293,9 +295,8 @@ class ChangeStreamCaptureTest {
         bootstrap();                                    // cursor 43, registry 6
 
         // A full page of registry rows for a tracked pair, all below its saved
-        // cursor (the state a partial 410 reseed leaves behind): nothing to
-        // pull, but rolling back would re-page this backlog on every poll
-        // forever — the full-page escape must pay one commit to skip it.
+        // cursor: nothing to pull, but rolling back would re-page this backlog on
+        // every poll forever — the full-page escape must pay one commit to skip it.
         StringBuilder entries = new StringBuilder();
         for (int i = 0; i < 1000; i++) {
             if (i > 0) {
@@ -311,29 +312,6 @@ class ChangeStreamCaptureTest {
         assertEquals(1100, registryOffset());           // escaped the wedge
         assertEquals(43, changeOffset());               // cursor untouched
         assertEquals(2, count(USER_TABLE));             // nothing captured
-    }
-
-    @Test
-    void blankSnapshotBootstrapDoesNotSeedCursors() throws SQLException {
-        // First contact, but /user/list answers a degenerate blank-but-200 body:
-        // the bootstrap must NOT seed cursors over the empty stage — that would
-        // mark the pair bootstrapped and permanently skip its pre-existing rows.
-        lists.put("user", "");
-        cursorsJson = cursorsPage(entry(5, 42), 6);
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(0, count(USER_TABLE));
-        assertEquals(0, count("ollylake.main.sccal_change_cursor"));   // retry next cycle
-        assertEquals(0, count("ollylake.main.sccal_registry_cursor"));
-
-        // The API heals; the next cycle bootstraps normally.
-        lists.put("user", "{\"10\":{\"userId\":\"10\",\"userName\":\"a@x.com\"},"
-            + "\"20\":{\"userId\":\"20\",\"userName\":\"b@x.com\"}}");
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(2, count(USER_TABLE));
-        assertEquals(43, changeOffset());
-        assertEquals(6, registryOffset());
     }
 
     @Test
@@ -357,21 +335,22 @@ class ChangeStreamCaptureTest {
         assertTrue(!userExists(30));
         assertEquals("renamed@x.com", userName(20));     // rest of the page applied
         assertEquals(45, changeOffset());                // cursor moved past the poison
-        assertEquals(2, count("ollylake.main.entity_change_audit"));  // both audited
+        assertEquals(2, count(AUDIT_TABLE));             // both audited
     }
 
-    // ---- scoped bootstrap / phase isolation ------------------------------------
+    // ---- scoped bootstrap / failure isolation ----------------------------------
 
     @Test
     void newPairBootstrapsWithoutWipingExistingCursors() throws SQLException {
         bootstrap();                                    // (CUST, TEN) at 43, registry at 6
 
         st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (3, 4)");
+        // (3, 4) is missing → partial bootstrap; no /changes queued → empty replay.
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(43, changeOffsetFor(CUST, TEN));   // healthy pair keeps its cursor
-        assertEquals(1, changeOffsetFor(3, 4));         // new pair: absent from registry → 1
-        assertEquals(6, registryOffset());              // partial reseed leaves the registry offset
+        assertEquals(1, changeOffsetFor(3, 4));         // new pair: empty replay → offset 1
+        assertEquals(6, registryOffset());              // partial bootstrap leaves the registry offset
     }
 
     @Test
@@ -412,34 +391,40 @@ class ChangeStreamCaptureTest {
     }
 
     @Test
-    void streamFailureDoesNotBlockSnapshotPhaseButStillSurfaces() throws SQLException {
+    void streamFailurePropagatesAndRollsBack() throws SQLException {
         bootstrap();
 
         // Mid-deploy environment: the V8 audit table is missing, so the change
-        // stream fails on its INSERT — the snapshot phase must still capture,
-        // but the failure must surface afterwards (stream-fed tables have no
-        // snapshot fallback, and a one-shot run must not exit 0 over it).
-        st.execute("DROP TABLE ollylake.main.entity_change_audit");
+        // stream fails on its INSERT. With no snapshot phase the failure
+        // propagates and the whole stream transaction rolls back.
+        st.execute("DROP TABLE " + AUDIT_TABLE);
         cursorsJson = cursorsPage(entry(7, 46), 8);
         changesResponses.add(changesPage(47, false,
             userChange(43, "CREATE", 30, "c@x.com", false)));
-        lists.put("workspace", "{\"1\":{\"workspaceId\":\"1\",\"name\":\"ws-1\"}}");
 
-        assertThrows(IllegalStateException.class,
+        assertThrows(SQLException.class,
             () -> SccalReferenceSync.runOnce(conn, st, http, "http://stub"));
 
-        assertEquals(1, count("ollylake.main.workspace"));  // snapshot phase ran
         assertEquals(43, changeOffset());                   // stream txn rolled back
         assertEquals(2, count(USER_TABLE));                 // stream data rolled back too
     }
 
     // ---- helpers -------------------------------------------------------------
 
-    /** First run: seeds users 10+20 via snapshot and the cursors at lastChangeId 42. */
+    /**
+     * First run: replays the change stream to seed users 10+20 and the cursor at
+     * change 42's page (offset 43). The replayed entries are audited during
+     * bootstrap; the audit log is cleared afterwards so each steady-state test
+     * counts only its own audit rows.
+     */
     private void bootstrap() throws SQLException {
         cursorsJson = cursorsPage(entry(5, 42), 6);
+        changesResponses.add(changesPage(43, false,
+            userChange(41, "CREATE", 10, "a@x.com", false),
+            userChange(42, "CREATE", 20, "b@x.com", false)));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
         assertEquals(2, count(USER_TABLE));
+        st.execute("DELETE FROM " + AUDIT_TABLE);
     }
 
     private static String entry(long seq, long lastChangeId) {
@@ -486,8 +471,7 @@ class ChangeStreamCaptureTest {
                     ? TestSupport.response(status, "", uri)
                     : TestSupport.response(200, (String) next, uri);
             }
-            return TestSupport.response(200,
-                lists.getOrDefault(TestSupport.objectTypeOf(uri), "{}"), uri);
+            throw new AssertionError("unexpected endpoint (only /cursors and /changes exist): " + path);
         });
     }
 

@@ -36,10 +36,26 @@ final class TestSupport {
         return conn;
     }
 
-    /** Run one project SQL file (e.g. an {@code ollylake/init} migration), statement by statement. */
+    /**
+     * Run one project SQL file (e.g. an {@code ollylake/init} migration),
+     * statement by statement.
+     *
+     * <p>DuckLake partitioning syntax is dropped: the plain in-memory catalog
+     * {@link #openLake()} stands up cannot parse or execute it. Partitioning is
+     * a physical-layout concern of the production DuckLake catalog and does not
+     * affect what these correctness tests exercise. Two forms appear in the init
+     * SQL — a standalone {@code ALTER TABLE ... SET PARTITIONED BY (...)}
+     * (dropped whole) and a trailing {@code PARTITION BY (...)} clause on a
+     * {@code CREATE TABLE} (the clause is cut, the table kept).
+     */
     static void runSqlFile(Statement st, String path) throws Exception {
         for (String stmt : SqlScripts.splitStatements(Files.readString(Paths.get(path)))) {
-            st.execute(stmt);
+            String upper = stmt.toUpperCase(java.util.Locale.ROOT);
+            if (upper.contains("SET PARTITIONED BY")) {
+                continue;
+            }
+            int clause = upper.indexOf("PARTITION BY");
+            st.execute(clause < 0 ? stmt : stmt.substring(0, clause));
         }
     }
 
@@ -87,12 +103,6 @@ final class TestSupport {
         lenient().when(resp.body()).thenReturn(body);
         lenient().when(resp.uri()).thenReturn(uri);
         return resp;
-    }
-
-    /** {@code .../api/v1/<objectType>/list} → {@code <objectType>}. */
-    static String objectTypeOf(URI uri) {
-        String[] parts = uri.getPath().split("/");
-        return parts[parts.length - 2];
     }
 
     private TestSupport() {

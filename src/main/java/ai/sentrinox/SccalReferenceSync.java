@@ -6,42 +6,34 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Change-data-capture job for the analytics reference (dimension) tables.
  *
  * <p>Reads every {@code (customer_id, tenant_id)} pair from
  * {@code customer_tenant_reference} (the V1 table, stored in the DuckLake
- * catalog backed by MinIO), then calls the SCCAL internal-sync API
- * ({@code GET /internal/sccal/api/v1/{objectType}/list}) for each pair and
- * captures the changes into the V6 reference tables.
- *
- * <p>Capture is snapshot-based: for each target table the current API snapshot
- * (union-ed across all pairs and de-duplicated by key) is diffed against the
- * table and the difference is applied as INSERT (new), UPDATE (renamed) and
- * DELETE (absent / {@code isDeleted:true}) — the three CDC operations. The API
- * is queried without {@code commitId}, so every response is a full snapshot and
- * "absent from snapshot" is a safe delete signal. All table merges run in one
- * transaction, so the capture lands as a single atomic DuckLake snapshot; the
- * job is also idempotent, so a re-run converges.
+ * catalog backed by MinIO), then captures the reference tables purely from the
+ * SCCAL entity-change stream — the two polling endpoints
+ * ({@code GET /internal/sccal/api/v1/cursors} and
+ * {@code GET /internal/sccal/api/v1/changes}). There is no full-snapshot
+ * ({@code /list}) path: every INSERT / UPDATE / DELETE comes from an explicit
+ * change entry, so deletes are tombstones (never inferred from absence). See
+ * {@link ChangeStreamSync} for the two-level poll, bootstrap (replay from the
+ * start of a pair's stream) and 410-Gone (fast-forward past a pruned offset).
  *
  * <p>JSON is parsed by DuckDB itself (the raw response is bound as a {@code JSON}
- * parameter and shredded with {@code json_extract(...,'$.*')}), so the job needs
- * no JSON library beyond the DuckDB driver already on the classpath.
+ * parameter and shredded with {@code json_extract(...)}), so the job needs no
+ * JSON library beyond the DuckDB driver already on the classpath.
  *
  * <p>With {@code analytics_cdc.poll_interval = 0} (default) it runs one capture
  * and exits. A positive interval keeps the process alive and re-captures on that
@@ -56,39 +48,60 @@ public final class SccalReferenceSync {
     static final String API_PATH = "/internal/sccal/api/v1/";
 
     /**
-     * Object types that ignore tenant scoping — fetched once (with the first
-     * pair's credentials), not per pair. Only types that actually appear in
-     * {@link #SYNCS} belong here; an entry with no matching Sync is silently
-     * dropped at fetch time and only misleads the reader.
+     * One column of a reference table and how to pull it out of an entity.
      *
-     * <p>NOTE: "fetch once" assumes the API returns the SAME global snapshot
-     * regardless of the calling customer/tenant. If the API ever auth-trims a
-     * "global" response per caller, rows visible only to other pairs would be
-     * absent from the snapshot and treated as deletes — move such a type out of
-     * this set so it is fetched per pair and union-ed instead.
+     * <p>A column may map to more than one JSON field. The {@code /changes}
+     * stream carries two payload conventions in the same feed — a generic shape
+     * ({@code id}, {@code name}, {@code email}) and the real Sentrinox shape
+     * ({@code userId}, {@code userName}, ...) — so the extraction coalesces the
+     * alternatives (declared most-specific first) and takes the first present.
      */
-    private static final Set<String> GLOBAL_TYPES = Set.of("providercatalogue");
+    private record Col(String column, List<String> jsonFields, String sqlType) {
+        Col(String column, String jsonField, String sqlType) {
+            this(column, List.of(jsonField), sqlType);
+        }
 
-    /** One column of a reference table and how to pull it out of an entity. */
-    private record Col(String column, String jsonField, String sqlType) {
-        /** DuckDB expression extracting + casting this column from entity alias {@code e}. */
-        String expr() {
-            return "(e->>'" + jsonField + "')::" + sqlType;
+        /**
+         * Raw text extraction from entity alias {@code e}, aliased to the target
+         * column — no cast. Materialized in an inner projection so the typed
+         * {@link #castExpr()} in the outer projection references a plain column
+         * rather than {@code e}: mixing {@code (e->>'f')::TYPE} casts with the
+         * delete-normalising CASE (which also reads {@code e}) in one projection
+         * trips a DuckDB (1.4.5) planner conversion bug — the same one the audit
+         * shredder sidesteps.
+         */
+        String rawExpr() {
+            String extract = jsonFields.size() == 1
+                ? "e->>'" + jsonFields.get(0) + "'"
+                : "coalesce(" + join(jsonFields, f -> "e->>'" + f + "'", ", ") + ")";
+            return extract + " AS " + column;
+        }
+
+        /** Cast the materialized raw column (see {@link #rawExpr()}) to its SQL type. */
+        String castExpr() {
+            return column + "::" + sqlType + " AS " + column;
         }
     }
 
     /**
      * A reference table fed from one SCCAL object type, with the SQL needed to
-     * stage and capture it.
+     * stage and capture it from the change stream.
      *
-     * @param objectType API path segment ({@code user}, {@code rule}, ...)
+     * <p>Every target table also carries a {@code customer_id}. It is not in the
+     * entity payload — it comes from the poll context (the customer whose stream
+     * is being pulled) — so it is staged as a literal and is part of the CDC key,
+     * scoping every match to the owning customer (the tables are also
+     * {@code PARTITIONED BY (customer_id)}).
+     *
+     * @param objectType SCCAL object type ({@code user}, {@code workspace},
+     *                   {@code group}); the {@code /changes} entityType it maps
+     *                   to is declared in {@link #STREAM_ENTITY_TYPES}
      * @param table      target table, already schema-qualified and quoted
-     * @param keyCols    identity columns (the CDC key)
-     * @param dataCols   non-key attribute columns (e.g. name); empty for edge tables
-     * @param filter     optional extra predicate on the staged entity (alias {@code e})
+     * @param keyCols    identity columns (the per-customer CDC key)
+     * @param dataCols   non-key attribute columns (e.g. name)
      */
     record Sync(String objectType, String table, List<Col> keyCols,
-                List<Col> dataCols, String filter) {
+                List<Col> dataCols) {
 
         private List<Col> allCols() {
             List<Col> all = new ArrayList<>(keyCols);
@@ -96,18 +109,18 @@ public final class SccalReferenceSync {
             return all;
         }
 
-        /** Temp staging table name, unique per target table. */
-        private String stage() {
-            return stageName("cdc_stg_");
-        }
-
         private String stageName(String prefix) {
             return prefix + table.replaceAll("[^A-Za-z0-9]", "_");
         }
 
-        /** {@code t.k1 = s.k1 AND t.k2 = s.k2} for the staging-vs-target key match. */
+        /**
+         * {@code t.customer_id = s.customer_id AND t.k1 = s.k1 ...} — the
+         * staging-vs-target key match, always scoped by customer_id so a row is
+         * only ever matched within its owning customer.
+         */
         private String keyEq() {
-            return join(keyCols, c -> "t." + c.column() + " = s." + c.column(), " AND ");
+            return "t.customer_id = s.customer_id AND "
+                + join(keyCols, c -> "t." + c.column() + " = s." + c.column(), " AND ");
         }
 
         /** {@code col1 TYPE1, col2 TYPE2} column DDL for a staging table. */
@@ -120,58 +133,13 @@ public final class SccalReferenceSync {
             return join(dataCols, c -> c.column() + " = s." + c.column(), ", ");
         }
 
-        private String createTempSql() {
-            return "CREATE TEMP TABLE " + stage() + " (" + columnDefs() + ")";
-        }
-
-        /** Parameterised: bind the raw JSON response as parameter 1. */
-        String stageSql() {
-            String sql = "INSERT INTO " + stage() + " (" + columns(allCols()) + ") SELECT "
-                + join(allCols(), Col::expr, ", ")
-                + " FROM (SELECT unnest(json_extract(?::JSON, '$.*')) AS e)"
-                // isDeleted is omitempty; treat missing as active, true as a delete.
-                + " WHERE coalesce((e->>'isDeleted')::BOOLEAN, false) = false";
-            return filter == null ? sql : sql + " AND " + filter;
-        }
-
-        /** Collapse duplicate keys (e.g. a global type staged from several pairs). */
-        String dedupeSql() {
-            String keys = columns(keyCols);
-            // Order by ALL columns, not the partition keys: ordering by the keys
-            // alone leaves every row in a partition tied, so row_number() = 1 keeps
-            // an arbitrary row and the captured name flaps between runs (breaking
-            // idempotent convergence) when the same key arrives with differing data.
-            // Ordering by all columns makes the surviving row deterministic.
-            String order = columns(allCols());
-            return "CREATE OR REPLACE TEMP TABLE " + stage() + " AS SELECT * FROM " + stage()
-                + " QUALIFY row_number() OVER (PARTITION BY " + keys + " ORDER BY " + order + ") = 1";
-        }
-
-        String deleteSql() {
-            return "DELETE FROM " + table + " t WHERE NOT EXISTS "
-                + "(SELECT 1 FROM " + stage() + " s WHERE " + keyEq() + ")";
-        }
-
-        String updateSql() {
-            return "UPDATE " + table + " t SET " + setClause() + " FROM " + stage() + " s WHERE "
-                + keyEq() + " AND (" + changedPredicate() + ")";
-        }
-
-        String insertSql() {
-            String cols = columns(allCols());
-            return "INSERT INTO " + table + " (" + cols + ") SELECT " + cols + " FROM " + stage()
-                + " s WHERE NOT EXISTS (SELECT 1 FROM " + table + " t WHERE " + keyEq() + ")";
-        }
-
         private String changedPredicate() {
             return join(dataCols, c -> "t." + c.column() + " IS DISTINCT FROM s." + c.column(), " OR ");
         }
 
-        // ---- change-stream variants ------------------------------------------
-        // Fed from a /changes page (entity-change stream) instead of a snapshot.
-        // Deletes are explicit tombstones (action = 'DELETE'), never inferred
-        // from absence, so none of the snapshot path's empty-stage guarding is
-        // needed here.
+        // ---- change-stream staging + merge -----------------------------------
+        // Fed from a /changes page (entity-change stream). Deletes are explicit
+        // tombstones (action = 'DELETE'), never inferred from absence.
 
         /** Temp staging table for /changes entries, unique per target table. */
         String changeStage() {
@@ -179,35 +147,44 @@ public final class SccalReferenceSync {
         }
 
         String createChangeStageSql() {
-            return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " (" + columnDefs()
-                + ", __action VARCHAR, __change_id BIGINT)";
+            return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " (customer_id BIGINT, "
+                + columnDefs() + ", __action VARCHAR, __change_id BIGINT)";
         }
 
         /**
          * Parameterised: bind one raw /changes response body as parameter 1.
          * Stages the page's entries of {@code entityType}, pulling the columns
-         * out of each entry's {@code sccal} payload — aliased {@code e}, so
-         * {@link Col#expr()} and {@link #filter} apply unchanged.
+         * out of each entry's {@code sccal} payload — aliased {@code e} — and
+         * stamping {@code customerId} (the poll context, not in the payload) as a
+         * literal on every row.
          *
-         * <p>Two guards align this with the snapshot path's delete semantics:
-         * a non-DELETE action whose payload says {@code isDeleted:true} (a
-         * soft-delete modelled as an update) is normalised to a tombstone, and
-         * tombstones bypass {@link #filter} — a minimal DELETE payload may omit
-         * the filter field, and a NULL predicate would silently drop the delete.
-         * Deleting by key is safe for a sibling table the entity doesn't live
-         * in: the key simply matches nothing there.
+         * <p>Delete semantics: a non-DELETE action whose payload says
+         * {@code isDeleted:true} (the real shape) or {@code op:"delete"} (the
+         * generic shape) — a soft-delete modelled as an update — is normalised
+         * to a tombstone, so it removes the row rather than being applied as an
+         * update.
+         *
+         * <p>Two projections over {@code e}: the inner one materializes every
+         * field access ({@code isDeleted}, {@code op} and each column) as a raw
+         * text column ({@link Col#rawExpr()}); the outer one applies the typed
+         * casts ({@link Col#castExpr()}) and the delete-normalising CASE against
+         * those plain columns, never {@code e}. Mixing the {@code ::TYPE} casts
+         * and the CASE in one projection over {@code e} trips a DuckDB (1.4.5)
+         * planner conversion bug — the same one the audit shredder sidesteps.
          */
-        String stageChangesSql(String entityType) {
-            String sql = "INSERT INTO " + changeStage() + " (" + columns(allCols())
-                + ", __action, __change_id) SELECT " + join(allCols(), Col::expr, ", ")
-                + ", __action, __change_id FROM ("
-                + "SELECT entry->'sccal' AS e,"
-                + " CASE WHEN coalesce((entry->'sccal'->>'isDeleted')::BOOLEAN, false)"
-                + " THEN 'DELETE' ELSE entry->>'action' END AS __action,"
+        String stageChangesSql(String entityType, long customerId) {
+            return "INSERT INTO " + changeStage() + " (customer_id, " + columns(allCols())
+                + ", __action, __change_id) SELECT " + customerId + ", "
+                + join(allCols(), Col::castExpr, ", ")
+                + ", CASE WHEN coalesce(__is_deleted::BOOLEAN, false) OR __op = 'delete'"
+                + " THEN 'DELETE' ELSE action END AS __action, __change_id FROM ("
+                + "SELECT " + join(allCols(), Col::rawExpr, ", ")
+                + ", e->>'isDeleted' AS __is_deleted, e->>'op' AS __op,"
+                + " action, __change_id FROM ("
+                + "SELECT entry->'sccal' AS e, entry->>'action' AS action,"
                 + " (entry->>'id')::BIGINT AS __change_id"
                 + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS entry)"
-                + " WHERE entry->>'entityType' = '" + entityType + "')";
-            return filter == null ? sql : sql + " WHERE (__action = 'DELETE' OR " + filter + ")";
+                + " WHERE entry->>'entityType' = '" + entityType + "'))";
         }
 
         /**
@@ -217,7 +194,7 @@ public final class SccalReferenceSync {
          */
         String changeDedupeSql() {
             return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " AS SELECT * FROM " + changeStage()
-                + " QUALIFY row_number() OVER (PARTITION BY " + columns(keyCols)
+                + " QUALIFY row_number() OVER (PARTITION BY customer_id, " + columns(keyCols)
                 + " ORDER BY __change_id DESC) = 1";
         }
 
@@ -233,7 +210,7 @@ public final class SccalReferenceSync {
         }
 
         String changeInsertSql() {
-            String cols = columns(allCols());
+            String cols = "customer_id, " + columns(allCols());
             return "INSERT INTO " + table + " (" + cols + ") SELECT " + cols + " FROM " + changeStage()
                 + " s WHERE s.__action <> 'DELETE' AND " + notNull(allCols()) + " AND NOT EXISTS "
                 + "(SELECT 1 FROM " + table + " t WHERE " + keyEq() + ")";
@@ -263,7 +240,7 @@ public final class SccalReferenceSync {
                 log.warn("change stream: {} {} event(s) skipped — payload missing a required"
                     + " column (entry preserved in the audit log)", skipped, displayName());
             }
-            return applyDml(st, false, changeDeleteSql(), changeUpdateSql(), changeInsertSql());
+            return applyDml(st, changeDeleteSql(), changeUpdateSql(), changeInsertSql());
         }
 
         /** Staged non-tombstone rows with a NULL column: not insertable/updatable. */
@@ -275,33 +252,17 @@ public final class SccalReferenceSync {
             }
         }
 
-        /** Apply DELETE / UPDATE / INSERT; returns {inserted, updated, deleted}. */
-        private int[] merge(Statement st) throws SQLException {
-            // An empty staging table is ambiguous: it can mean "this type genuinely
-            // has no rows" but also "the API returned a blank/degenerate-but-200
-            // body" (coalesced to "{}") or "every pair failed". Treating that as a
-            // delete would wipe the whole target table on a transient hiccup, so
-            // skip DELETE when staging is empty and leave the existing rows intact.
-            return applyDml(st, stageIsEmpty(st), deleteSql(), updateSql(), insertSql());
-        }
-
         /**
-         * The shared apply sequence of both capture paths; returns
-         * {inserted, updated, deleted} — the order every totals consumer assumes.
-         * UPDATE is skipped for edge tables (no data columns to change).
+         * Apply DELETE / UPDATE / INSERT; returns {inserted, updated, deleted} —
+         * the order every totals consumer assumes. UPDATE is skipped for edge
+         * tables (no data columns to change).
          */
-        private int[] applyDml(Statement st, boolean skipDelete, String delete, String update,
-                               String insert) throws SQLException {
-            int deleted = skipDelete ? 0 : st.executeUpdate(delete);
+        private int[] applyDml(Statement st, String delete, String update, String insert)
+                throws SQLException {
+            int deleted = st.executeUpdate(delete);
             int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(update);
             int inserted = st.executeUpdate(insert);
             return new int[] {inserted, updated, deleted};
-        }
-
-        private boolean stageIsEmpty(Statement st) throws SQLException {
-            try (ResultSet rs = st.executeQuery("SELECT 1 FROM " + stage() + " LIMIT 1")) {
-                return !rs.next();
-            }
         }
 
         private String displayName() {
@@ -310,65 +271,40 @@ public final class SccalReferenceSync {
         }
     }
 
-    // The reference tables and the object type each is captured from.
-    // RULE feeds two tables, split by the ruleType enum: 0 = TenantProvider /
-    // 1 = WorkspaceProvider are LLM/provider access rules, 2 = TenantMcp /
-    // 3 = WorkspaceMcp are MCP access rules (tenant vs. workspace scope).
+    // The reference tables and the object type each is captured from. The
+    // /changes stream only ever emits USER, WORKSPACE and GROUP entities, so
+    // those are the only object types captured; every other V6 table has no
+    // corresponding stream entity and is left empty.
+    //
+    // Each column coalesces the two payload conventions the stream mixes (see
+    // Col): the real Sentrinox shape ({userId, userName, isDeleted}) declared
+    // first, then the generic shape ({id, name, email}). Whichever the entry
+    // carries, the row is captured.
     static final List<Sync> SYNCS = List.of(
         new Sync("workspace", "ollylake.main.workspace",
-            List.of(new Col("workspace_id", "workspaceId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), null),
+            List.of(new Col("workspace_id", List.of("workspaceId", "id"), "BIGINT")),
+            List.of(new Col("name", List.of("workspaceName", "name"), "VARCHAR"))),
         new Sync("user", "ollylake.main.\"user\"",
-            List.of(new Col("user_id", "userId", "BIGINT")),
-            List.of(new Col("name", "userName", "VARCHAR")), null),
-        new Sync("usergroup", "ollylake.main.\"group\"",
-            List.of(new Col("group_id", "userGroupId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), null),
-        new Sync("usergroupmembership", "ollylake.main.user_group_mapping",
-            List.of(new Col("user_id", "userId", "BIGINT"),
-                    new Col("group_id", "userGroupId", "BIGINT")),
-            List.of(), null),
-        new Sync("providercatalogue", "ollylake.main.provider",
-            List.of(new Col("provider_id", "type", "INTEGER")),
-            List.of(new Col("name", "name", "VARCHAR")), null),
-        new Sync("rule", "ollylake.main.llm_access_rule",
-            List.of(new Col("llm_access_rule_id", "ruleId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER IN (0, 1)"),
-        new Sync("rule", "ollylake.main.mcp_access_rule",
-            List.of(new Col("mcp_access_rule_id", "ruleId", "BIGINT")),
-            List.of(new Col("name", "name", "VARCHAR")), "(e->>'ruleType')::INTEGER IN (2, 3)")
+            List.of(new Col("user_id", List.of("userId", "id"), "BIGINT")),
+            List.of(new Col("name", List.of("userName", "email"), "VARCHAR"))),
+        new Sync("group", "ollylake.main.\"group\"",
+            List.of(new Col("group_id", List.of("groupId", "id"), "BIGINT")),
+            List.of(new Col("name", List.of("groupName", "name"), "VARCHAR")))
     );
 
     /**
-     * Object types now fed from the entity-change stream ({@code /changes})
-     * instead of the per-cycle full-snapshot diff: snapshot-API objectType →
-     * the {@code /changes} entityType that feeds it (the stream emits enum
-     * names, the snapshot API path segments). The SINGLE source of truth for
-     * the stream/snapshot split — {@link #STREAM_SYNCS}, {@link #SNAPSHOT_SYNCS}
-     * and {@link ChangeStreamSync#SYNCS_BY_ENTITY_TYPE} all derive from it, so
-     * promoting a type to the stream is one entry here. Grows as SCCAL wires
-     * more capture types (USER + ACTIVATION today; ACTIVATION feeds no
-     * reference table). The snapshot machinery still covers these types on
-     * bootstrap and on a 410 Gone resync — see {@link ChangeStreamSync}.
+     * SCCAL object type → the {@code /changes} entityType that feeds it (the
+     * stream emits enum names, the snapshot API used lowercase path segments).
+     * Every reference table is fed from the change stream, so every object type
+     * in {@link #SYNCS} appears here. The SINGLE source of truth for the
+     * type→entityType mapping — {@link ChangeStreamSync#SYNCS_BY_ENTITY_TYPE}
+     * derives from it. ACTIVATION entries also flow through the stream (audited)
+     * but feed no reference table, so they have no entry here.
      */
-    static final Map<String, String> STREAM_ENTITY_TYPES = Map.of("user", "USER");
-
-    /** Stream-fed syncs (bootstrap / resync scope). Declared after SYNCS. */
-    static final List<Sync> STREAM_SYNCS = SYNCS.stream()
-        .filter(s -> STREAM_ENTITY_TYPES.containsKey(s.objectType())).toList();
-
-    /** Syncs still captured by snapshot diff every cycle. */
-    static final List<Sync> SNAPSHOT_SYNCS = SYNCS.stream()
-        .filter(s -> !STREAM_ENTITY_TYPES.containsKey(s.objectType())).toList();
-
-    /** objectType -> the sync(s) it feeds (RULE feeds two), in declared order. */
-    private static Map<String, List<Sync>> groupByType(List<Sync> syncs) {
-        Map<String, List<Sync>> byType = new LinkedHashMap<>();
-        for (Sync s : syncs) {
-            byType.computeIfAbsent(s.objectType(), k -> new ArrayList<>()).add(s);
-        }
-        return byType;
-    }
+    static final Map<String, String> STREAM_ENTITY_TYPES = Map.of(
+        "workspace", "WORKSPACE",
+        "user", "USER",
+        "group", "GROUP");
 
     public static void main(String[] args) throws Exception {
         Config config = ConfigFactory.load().getConfig("analytics_cdc");
@@ -379,17 +315,17 @@ public final class SccalReferenceSync {
 
         HttpClient http = SccalHttp.newClient();
 
-        // Bootstrap once (extensions + S3 secret + ATTACH); the warm connection is
-        // reused across every cycle.
-        try (Connection conn = SqlScripts.bootstrap(config);
-             Statement st = conn.createStatement()) {
-
-            if (isOneShot(pollInterval)) {
-                runOnce(conn, st, http, baseUrl);          // one-shot
+        if (isOneShot(pollInterval)) {
+            // One-shot: bootstrap once (extensions + S3 secret + ATTACH) and run.
+            try (Connection conn = SqlScripts.bootstrap(config);
+                 Statement st = conn.createStatement()) {
+                runOnce(conn, st, http, baseUrl);
                 log.info("SCCAL reference sync complete.");
-            } else {
-                poll(conn, st, http, baseUrl, pollInterval);
             }
+        } else {
+            // Polling: poll() owns the connection so it can rebuild it after a
+            // failure that leaves it unusable (see the loop below).
+            poll(config, http, baseUrl, pollInterval);
         }
     }
 
@@ -398,14 +334,64 @@ public final class SccalReferenceSync {
         return pollInterval.isZero() || pollInterval.isNegative();
     }
 
-    /** Repeatedly capture on a fixed interval, surviving per-cycle failures. */
-    private static void poll(Connection conn, Statement st, HttpClient http,
-                             String baseUrl, Duration interval) throws InterruptedException {
+    /**
+     * Repeatedly capture on a fixed interval, surviving per-cycle failures.
+     *
+     * <p>Owns the DuckDB connection so it can rebuild it: a failed cycle can
+     * abort the DuckLake catalog transaction on the shared Postgres connection
+     * (which an in-place rollback cannot always clear) and can close the JDBC
+     * statement. Before each cycle the connection + statement are (re)bootstrapped
+     * if unusable — a fresh ATTACH gives a fresh catalog connection — so a single
+     * transient catalog error can no longer wedge the poller permanently.
+     */
+    private static void poll(Config config, HttpClient http, String baseUrl,
+                             Duration interval) throws InterruptedException {
         log.info("Polling every {}s (Ctrl-C to stop).", interval.toSeconds());
-        while (true) {
-            log.info("--- sync cycle ---");
-            pollCycle(conn, st, http, baseUrl);
-            Thread.sleep(interval.toMillis());
+        Connection conn = null;
+        Statement st = null;
+        try {
+            while (true) {
+                log.info("--- sync cycle ---");
+                if (!usable(conn, st)) {
+                    try {
+                        closeQuietly(conn);        // closes st with it, if any
+                        conn = SqlScripts.bootstrap(config);
+                        st = conn.createStatement();
+                    } catch (Exception e) {
+                        log.error("could not (re)establish the DuckDB connection"
+                            + " — retrying next interval", e);
+                        closeQuietly(conn);
+                        conn = null;
+                        st = null;
+                        Thread.sleep(interval.toMillis());
+                        continue;
+                    }
+                }
+                pollCycle(conn, st, http, baseUrl);
+                Thread.sleep(interval.toMillis());
+            }
+        } finally {
+            closeQuietly(conn);
+        }
+    }
+
+    /** True when the connection and statement are both open and reusable. */
+    private static boolean usable(Connection conn, Statement st) {
+        try {
+            return conn != null && !conn.isClosed() && st != null && !st.isClosed();
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    /** Close a connection (and its statements) ignoring any error. */
+    private static void closeQuietly(Connection conn) {
+        if (conn != null) {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // Already closed or unusable — nothing more to do.
+            }
         }
     }
 
@@ -419,9 +405,9 @@ public final class SccalReferenceSync {
             runOnce(conn, st, http, baseUrl);
         } catch (Exception e) {
             log.error("sync cycle failed — retrying next interval", e);
-            // The failure (or a throw from applyCapture's finally) may have left
-            // the connection mid-transaction with autoCommit still false. Reset it
-            // so this stale state can't leak into the next cycle's staging writes.
+            // The failure may have left the connection mid-transaction with
+            // autoCommit still false. Reset it so this stale state can't leak
+            // into the next cycle's writes.
             resetConnection(conn);
         }
     }
@@ -441,14 +427,10 @@ public final class SccalReferenceSync {
     }
 
     /**
-     * One full capture pass, two phases:
-     * <ol>
-     *   <li><b>change stream</b> — stream-fed types via {@code /cursors}
-     *       discovery + per-tenant {@code /changes} deltas (usually a single
-     *       cheap idle call);</li>
-     *   <li><b>snapshot diff</b> — every other type, fetched in full and
-     *       diffed, exactly as before.</li>
-     * </ol>
+     * One full capture pass: drive the change stream for every tracked pair —
+     * {@code /cursors} discovery + per-tenant {@code /changes} deltas (usually a
+     * single cheap idle call), with a first-contact bootstrap that replays a
+     * pair's stream from the start. See {@link ChangeStreamSync}.
      */
     static void runOnce(Connection conn, Statement st, HttpClient http,
                         String baseUrl) throws SQLException {
@@ -458,159 +440,12 @@ public final class SccalReferenceSync {
                 + " — nothing to capture.");
             return;
         }
-        // The phases are independent (disjoint tables, separate transactions):
-        // a stream failure — endpoint down, pruned offset, missing audit table —
-        // must never block snapshot capture for the other dimension tables. But
-        // it must still SURFACE after the snapshot phase: the stream-fed tables
-        // have no snapshot fallback in steady state, so a swallowed persistent
-        // failure would leave them silently stale — and let a one-shot run
-        // (cron/CI) exit 0 with monitoring none the wiser.
-        Exception streamFailure = null;
-        try {
-            ChangeStreamSync.run(conn, st, http, baseUrl, pairs);
-        } catch (SQLException | RuntimeException e) {
-            log.warn("change stream phase failed — continuing with the snapshot phase", e);
-            resetConnection(conn);
-            streamFailure = e;
-        }
-        stageAll(conn, st, http, baseUrl, pairs, SNAPSHOT_SYNCS);
-        applyCapture(conn, st, SNAPSHOT_SYNCS);
-        if (streamFailure != null) {
-            throw new IllegalStateException(
-                "change stream phase failed (snapshot phase completed)", streamFailure);
-        }
+        ChangeStreamSync.run(conn, st, http, baseUrl, pairs);
     }
 
-    /**
-     * Fetch the given syncs' object types and stage their rows; globals once,
-     * tenant types per pair. Returns the total number of rows staged — zero
-     * means every response was empty or degenerate, which the resync path uses
-     * to withhold cursor seeding.
-     */
-    static long stageAll(Connection conn, Statement st, HttpClient http,
-                         String baseUrl, List<long[]> pairs, List<Sync> syncs) throws SQLException {
-        Map<String, List<Sync>> byType = groupByType(syncs);
-        List<String> globalTypes = byType.keySet().stream().filter(GLOBAL_TYPES::contains).toList();
-        List<String> tenantTypes = byType.keySet().stream().filter(t -> !GLOBAL_TYPES.contains(t)).toList();
-
-        for (Sync s : syncs) {
-            st.execute("DROP TABLE IF EXISTS " + s.stage());
-            st.execute(s.createTempSql());
-        }
-
-        long staged = 0;
-        // Global types ignore tenant scoping — fetch once (params still required).
-        if (!globalTypes.isEmpty()) {
-            long[] any = pairs.get(0);
-            staged += stageResponses(conn, byType, fetchAll(http, baseUrl, globalTypes, any[0], any[1]));
-        }
-        // Tenant-scoped types — fetched concurrently for each pair.
-        if (!tenantTypes.isEmpty()) {
-            for (long[] pair : pairs) {
-                staged += stageResponses(conn, byType, fetchAll(http, baseUrl, tenantTypes, pair[0], pair[1]));
-            }
-        }
-        return staged;
-    }
-
-    /** Parse each JSON map (via DuckDB) and append its active rows to the fed stage tables. */
-    private static long stageResponses(Connection conn, Map<String, List<Sync>> byType,
-                                       Map<String, String> responses) throws SQLException {
-        long staged = 0;
-        for (Map.Entry<String, String> e : responses.entrySet()) {
-            for (Sync s : byType.get(e.getKey())) {
-                staged += DuckJson.executeWithJson(conn, s.stageSql(), e.getValue());
-            }
-        }
-        return staged;
-    }
-
-    /** De-dupe staging, then merge every table inside one transaction (atomic snapshot). */
-    private static void applyCapture(Connection conn, Statement st, List<Sync> syncs) throws SQLException {
-        printCaptureHeader();
-        try {
-            SqlScripts.inTransaction(conn, () -> {
-                int[] totals = mergeAll(st, syncs);
-                printCaptureTotals(totals);
-                // Nothing changed → roll back so we don't write an empty DuckLake snapshot.
-                return totals[0] + totals[1] + totals[2] > 0;
-            });
-        } finally {
-            dropStages(st, syncs);
-        }
-    }
-
-    /**
-     * De-dupe each stage then merge it; prints one row per table and returns
-     * {ins, upd, del} totals. No transaction management — the caller owns the
-     * transaction (so cursor-state writes can join it).
-     */
-    static int[] mergeAll(Statement st, List<Sync> syncs) throws SQLException {
-        for (Sync s : syncs) {
-            st.execute(s.dedupeSql());
-        }
-        int[] totals = new int[3];
-        for (Sync s : syncs) {
-            int[] c = s.merge(st);
-            addCounts(totals, c);
-            log.info(String.format("%-28s %7d %7d %7d", s.displayName(), c[0], c[1], c[2]));
-        }
-        return totals;
-    }
-
-    /** Accumulate {ins, upd, del} deltas into the running totals, in place. */
-    static void addCounts(int[] totals, int[] delta) {
-        for (int i = 0; i < delta.length; i++) {
-            totals[i] += delta[i];
-        }
-    }
-
-    static void printCaptureHeader() {
-        log.info(String.format("%-28s %7s %7s %7s", "table", "ins", "upd", "del"));
-        log.info("-".repeat(52));
-    }
-
-    static void printCaptureTotals(int[] totals) {
-        log.info("-".repeat(52));
-        log.info(String.format("%-28s %7d %7d %7d", "TOTAL", totals[0], totals[1], totals[2]));
-    }
-
-    static void dropStages(Statement st, List<Sync> syncs) throws SQLException {
-        for (Sync s : syncs) {
-            st.execute("DROP TABLE IF EXISTS " + s.stage());
-        }
-    }
-
-    // ---- API ----------------------------------------------------------------
-
-    /** Issue all requests concurrently, then collect the bodies (keyed by object type). */
-    static Map<String, String> fetchAll(HttpClient http, String baseUrl,
-                                         List<String> types, long customerId, long tenantId) {
-        Map<String, CompletableFuture<HttpResponse<String>>> inflight = new LinkedHashMap<>();
-        for (String type : types) {
-            inflight.put(type, http.sendAsync(
-                request(baseUrl, type, customerId, tenantId), HttpResponse.BodyHandlers.ofString()));
-        }
-        Map<String, String> bodies = new LinkedHashMap<>();
-        for (Map.Entry<String, CompletableFuture<HttpResponse<String>>> e : inflight.entrySet()) {
-            HttpResponse<String> resp = SccalHttp.join(e.getValue(), "fetch failed for "
-                + e.getKey() + " (customerId=" + customerId + ", tenantId=" + tenantId + ")");
-            bodies.put(e.getKey(), SccalHttp.requireOk(resp));
-        }
-        return bodies;
-    }
-
-    private static HttpRequest request(String baseUrl, String objectType,
-                                       long customerId, long tenantId) {
-        // customerId/tenantId are numeric ids, so no URL-encoding is needed.
-        return SccalHttp.jsonGet(baseUrl + API_PATH + objectType + "/list"
-            + "?customerId=" + customerId + "&tenantId=" + tenantId);
-    }
-
-    // INVARIANT: this set of pairs defines the capture scope. Because absence from
-    // the snapshot is a delete signal and the target tables are not tenant-scoped,
-    // removing a pair here will delete that pair's still-live rows on the next pass.
-    // Only remove a pair when its captured rows are genuinely meant to be purged.
+    // INVARIANT: this set of pairs defines the capture scope. Registry rows for
+    // pairs outside it are ignored (see ChangeStreamSync#inScope), so removing a
+    // pair here stops capturing its changes.
     private static List<long[]> readCustomerTenantPairs(Statement st) throws SQLException {
         List<long[]> pairs = new ArrayList<>();
         try (ResultSet rs = st.executeQuery(
@@ -630,14 +465,7 @@ public final class SccalReferenceSync {
     }
 
     private static <T> String join(List<T> items, Function<T, String> render, String sep) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < items.size(); i++) {
-            if (i > 0) {
-                sb.append(sep);
-            }
-            sb.append(render.apply(items.get(i)));
-        }
-        return sb.toString();
+        return items.stream().map(render).collect(Collectors.joining(sep));
     }
 
     private static String trimSlash(String url) {

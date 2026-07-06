@@ -49,8 +49,8 @@ final class SqlScripts {
     /**
      * Run {@code body} in a transaction on {@code conn}: autoCommit off, commit
      * or roll back per the body's return value, roll back on a throw, and always
-     * restore autoCommit. The one home for the scaffold the snapshot capture,
-     * change-stream apply and resync paths all share.
+     * restore autoCommit. The one home for the scaffold the change-stream apply
+     * and bootstrap paths share.
      */
     static void inTransaction(Connection conn, TxnBody body) throws SQLException {
         conn.setAutoCommit(false);

@@ -26,7 +26,7 @@ final class SccalHttp {
     }
 
     /** GET request for a JSON endpoint, with the shared timeout and Accept header. */
-    static HttpRequest jsonGet(String url) {
+    private static HttpRequest jsonGet(String url) {
         return HttpRequest.newBuilder(URI.create(url))
             .timeout(REQUEST_TIMEOUT)
             .header("Accept", "application/json")
@@ -41,8 +41,8 @@ final class SccalHttp {
     }
 
     /** Join an async send, unwrapping the CompletionException into {@code message}. */
-    static HttpResponse<String> join(CompletableFuture<HttpResponse<String>> inflight,
-                                     String message) {
+    private static HttpResponse<String> join(CompletableFuture<HttpResponse<String>> inflight,
+                                             String message) {
         try {
             return inflight.join();
         } catch (CompletionException ce) {
@@ -62,7 +62,7 @@ final class SccalHttp {
      * Blank/absent 200 bodies coalesce to {@code "{}"} — the contract the
      * empty-stage delete guard relies on; both capture paths must use this.
      */
-    static String coalesceBody(String body) {
+    private static String coalesceBody(String body) {
         return (body == null || body.isBlank()) ? "{}" : body;
     }
 

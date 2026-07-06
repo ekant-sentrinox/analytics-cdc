@@ -20,52 +20,58 @@ class ChangeStreamSqlTest {
     }
 
     @Test
-    void userIsStreamFedAndOutOfTheSnapshotSet() {
-        assertTrue(SccalReferenceSync.STREAM_SYNCS.stream()
-            .anyMatch(s -> s.objectType().equals("user")));
-        assertTrue(SccalReferenceSync.SNAPSHOT_SYNCS.stream()
-            .noneMatch(s -> s.objectType().equals("user")));
-        // Everything else still snapshots.
-        assertEquals(SccalReferenceSync.SYNCS.size() - SccalReferenceSync.STREAM_SYNCS.size(),
-            SccalReferenceSync.SNAPSHOT_SYNCS.size());
+    void everyObjectTypeIsStreamFed() {
+        // With the snapshot (/list) path removed, every reference table is fed
+        // from the change stream: each sync's objectType must map to a /changes
+        // entityType, and each entityType must resolve back to its sync(s).
+        for (SccalReferenceSync.Sync s : SccalReferenceSync.SYNCS) {
+            String entityType = SccalReferenceSync.STREAM_ENTITY_TYPES.get(s.objectType());
+            assertTrue(entityType != null,
+                "no entityType mapping for objectType " + s.objectType());
+            assertTrue(ChangeStreamSync.SYNCS_BY_ENTITY_TYPE.get(entityType).contains(s),
+                "sync not reachable via entityType " + entityType);
+        }
     }
 
     @Test
     void stageChangesExtractsSccalPayloadActionAndChangeId() {
-        String sql = sync("ollylake.main.\"user\"").stageChangesSql("USER");
+        String sql = sync("ollylake.main.\"user\"").stageChangesSql("USER", 7L);
 
         assertTrue(sql.startsWith(
-            "INSERT INTO cdc_chg_ollylake_main__user_ (user_id, name, __action, __change_id)"), sql);
+            "INSERT INTO cdc_chg_ollylake_main__user_ (customer_id, user_id, name,"
+                + " __action, __change_id)"), sql);
+        // customer_id is stamped from the poll context, not extracted from JSON;
+        // the outer projection casts the materialized raw columns.
+        assertTrue(sql.contains("__change_id) SELECT 7, user_id::BIGINT AS user_id"), sql);
         assertTrue(sql.contains("unnest(json_extract(?::JSON, '$.entries[*]'))"), sql);
         assertTrue(sql.contains("entry->'sccal' AS e"), sql);
         assertTrue(sql.contains("entry->>'entityType' = 'USER'"), sql);
-        assertTrue(sql.contains("(e->>'userId')::BIGINT"), sql);
-        assertTrue(sql.contains("(e->>'userName')::VARCHAR"), sql);
-    }
-
-    @Test
-    void stageChangesAppendsTheSyncFilterButExemptsTombstones() {
-        // RULE fan-out (future stream type): the ruleType filter must survive,
-        // but a DELETE tombstone whose minimal payload omits ruleType must not
-        // be dropped by it (a NULL predicate would silently lose the delete).
-        assertTrue(sync("ollylake.main.llm_access_rule").stageChangesSql("RULE")
-            .endsWith("WHERE (__action = 'DELETE' OR (e->>'ruleType')::INTEGER IN (0, 1))"));
+        // The inner projection extracts each column (coalescing the real shape
+        // then the generic shape); the outer projection casts it to its SQL type.
+        assertTrue(sql.contains("coalesce(e->>'userId', e->>'id') AS user_id"), sql);
+        assertTrue(sql.contains("coalesce(e->>'userName', e->>'email') AS name"), sql);
+        assertTrue(sql.contains("name::VARCHAR AS name"), sql);
     }
 
     @Test
     void softDeletesNormaliseToTombstones() {
         // A non-DELETE action carrying sccal.isDeleted:true is a soft-delete;
-        // the snapshot path drops such rows, so the stream path must delete them.
-        String sql = sync("ollylake.main.\"user\"").stageChangesSql("USER");
+        // the stream path must delete such rows rather than apply them as updates.
+        String sql = sync("ollylake.main.\"user\"").stageChangesSql("USER", 7L);
+        // isDeleted/op are materialized in the inner projection; the CASE in the
+        // outer projection reads those plain columns (never `e`).
+        assertTrue(sql.contains("e->>'isDeleted' AS __is_deleted"), sql);
+        assertTrue(sql.contains("e->>'op' AS __op"), sql);
+        // Both delete conventions normalise to a tombstone: isDeleted (real) and op (generic).
         assertTrue(sql.contains(
-            "CASE WHEN coalesce((entry->'sccal'->>'isDeleted')::BOOLEAN, false)"), sql);
-        assertTrue(sql.contains("THEN 'DELETE' ELSE entry->>'action' END AS __action"), sql);
+            "CASE WHEN coalesce(__is_deleted::BOOLEAN, false) OR __op = 'delete'"), sql);
+        assertTrue(sql.contains("THEN 'DELETE' ELSE action END AS __action"), sql);
     }
 
     @Test
     void dedupeKeepsTheLastEventPerKey() {
         String sql = sync("ollylake.main.\"user\"").changeDedupeSql();
-        assertTrue(sql.contains("PARTITION BY user_id ORDER BY __change_id DESC"), sql);
+        assertTrue(sql.contains("PARTITION BY customer_id, user_id ORDER BY __change_id DESC"), sql);
     }
 
     @Test
@@ -73,7 +79,8 @@ class ChangeStreamSqlTest {
         assertEquals(
             "DELETE FROM ollylake.main.\"user\" t WHERE EXISTS "
                 + "(SELECT 1 FROM cdc_chg_ollylake_main__user_ s "
-                + "WHERE t.user_id = s.user_id AND s.__action = 'DELETE')",
+                + "WHERE t.customer_id = s.customer_id AND t.user_id = s.user_id"
+                + " AND s.__action = 'DELETE')",
             sync("ollylake.main.\"user\"").changeDeleteSql());
     }
 
@@ -89,10 +96,10 @@ class ChangeStreamSqlTest {
     }
 
     @Test
-    void changeStageIsDistinctFromSnapshotStage() {
+    void changeStageHasStableNamePerTable() {
         SccalReferenceSync.Sync user = sync("ollylake.main.\"user\"");
-        // Both temp tables can exist in one cycle (bootstrap uses the snapshot
-        // stage; the next poll uses the change stage on the same connection).
+        // The staging table name is derived from the target table, so it is
+        // stable across cycles and CREATE OR REPLACE reuses it.
         assertTrue(user.createChangeStageSql().startsWith(
             "CREATE OR REPLACE TEMP TABLE cdc_chg_ollylake_main__user_ ("),
             user.createChangeStageSql());

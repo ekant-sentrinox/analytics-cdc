@@ -4,35 +4,37 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.URI;
 import java.net.http.HttpClient;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayDeque;
+import java.util.Deque;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * End-to-end capture test against a real in-memory DuckDB, with the SCCAL API
- * stubbed by Mockito. Exercises the three CDC operations plus idempotency,
- * using the project's actual V1/V6/V7 schema SQL.
- *
- * <p>Snapshot-diff semantics are asserted on {@code workspace} (still
- * snapshot-fed); {@code user} is stream-fed and only reaches the snapshot path
- * on first-run bootstrap — its steady-state behaviour is covered by
- * {@link ChangeStreamCaptureTest}. The stub answers {@code /cursors} and
- * {@code /changes} with an empty body, so the change stream bootstraps on the
- * first run and is idle after that.
+ * End-to-end capture test against a real in-memory DuckDB, with the two SCCAL
+ * endpoints stubbed. Proves that every stream-fed reference table (USER,
+ * WORKSPACE, GROUP) — not just users — is populated from the change stream
+ * ({@code /cursors} + {@code /changes}), each row stamped with its owning
+ * customer_id; there is no {@code /list} snapshot path. Uses the project's
+ * actual V1/V6/V7/V8 schema SQL.
  */
 class SccalReferenceSyncCaptureTest {
 
+    private static final long CUST = 66109578638528512L;
+    private static final long TEN = 67545582738083840L;
+
     private Connection conn;
     private Statement st;
-    /** objectType -> canned JSON the stub returns; tests mutate this between runs. */
-    private final Map<String, String> responses = new HashMap<>();
-    /** HTTP status the stub returns; tests flip this to simulate a failing cycle. */
+    /** Body the /cursors stub returns (any startOffset). */
+    private String cursorsJson = "{}";
+    /** FIFO of /changes responses: String body (HTTP 200) or Integer status. */
+    private final Deque<Object> changesResponses = new ArrayDeque<>();
+    /** HTTP status the stub returns for every endpoint; tests flip this to fail a cycle. */
     private int stubStatus = 200;
     private HttpClient http;
 
@@ -44,23 +46,7 @@ class SccalReferenceSyncCaptureTest {
         TestSupport.runSqlFile(st, "ollylake/init/V6__reference_tables.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V1__create_customer_tenant_ids_table.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
-
-        responses.put("user", "{\"10\":{\"userId\":\"10\",\"userName\":\"a@x.com\"},"
-            + "\"20\":{\"userId\":\"20\",\"userName\":\"b@x.com\"},"
-            + "\"30\":{\"userId\":\"30\",\"userName\":\"c@x.com\"}}");
-        responses.put("usergroup", "{\"100\":{\"userGroupId\":\"100\",\"name\":\"Admins\"}}");
-        responses.put("usergroupmembership", "{\"10:100\":{\"userId\":\"10\",\"userGroupId\":\"100\"}}");
-        responses.put("workspace", "{\"1\":{\"workspaceId\":\"1\",\"name\":\"ws-1\"},"
-            + "\"2\":{\"workspaceId\":\"2\",\"name\":\"ws-2\"}}");
-        responses.put("providercatalogue", "{\"500\":{\"providerCatalogueId\":\"500\",\"name\":\"Anthropic\",\"type\":1},"
-            + "\"501\":{\"providerCatalogueId\":\"501\",\"name\":\"OpenAI\",\"type\":2}}");
-        // One rule per ruleType: 0 = TenantProvider, 1 = WorkspaceProvider
-        // (both feed llm_access_rule), 2 = TenantMcp, 3 = WorkspaceMcp
-        // (both feed mcp_access_rule).
-        responses.put("rule", "{\"a\":{\"ruleId\":\"900\",\"name\":\"Allow\",\"ruleType\":0},"
-            + "\"b\":{\"ruleId\":\"901\",\"name\":\"Block\",\"ruleType\":1},"
-            + "\"c\":{\"ruleId\":\"902\",\"name\":\"MCP Allow\",\"ruleType\":2},"
-            + "\"d\":{\"ruleId\":\"903\",\"name\":\"MCP WS Allow\",\"ruleType\":3}}");
+        TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
         http = stubClient();
     }
 
@@ -71,21 +57,68 @@ class SccalReferenceSyncCaptureTest {
     }
 
     @Test
-    void fullSnapshotInsertsEveryTable() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+    void fullStreamBootstrapInsertsEveryTable() throws SQLException {
+        bootstrap();
 
         assertEquals(2, count("ollylake.main.workspace"));
         assertEquals(3, count("ollylake.main.\"user\""));
-        assertEquals(1, count("ollylake.main.\"group\""));
-        assertEquals(1, count("ollylake.main.user_group_mapping"));
-        assertEquals(2, count("ollylake.main.provider"));
-        assertEquals(2, count("ollylake.main.llm_access_rule"));
-        assertEquals(2, count("ollylake.main.mcp_access_rule"));
+        assertEquals(2, count("ollylake.main.\"group\""));
+
+        // customer_id comes from the poll context (the pulled pair), not the
+        // payload, and must be stamped on every captured row.
+        assertEquals(CUST, TestSupport.queryLong(st,
+            "SELECT customer_id FROM ollylake.main.\"user\" WHERE user_id = 10"));
+        assertEquals(CUST, TestSupport.queryLong(st,
+            "SELECT customer_id FROM ollylake.main.\"group\" WHERE group_id = 100"));
     }
 
     @Test
-    void reRunWithUnchangedDataIsIdempotent() throws SQLException {
+    void capturesGenericPayloadShape() throws SQLException {
+        // The stream mixes a generic payload shape ({id, op, type, name/email})
+        // with the real one; both must be captured. Here every entry uses the
+        // generic shape — key from `id`, user name from `email`, others `name`.
+        cursorsJson = cursorsPage(entry(1, 3), 2);
+        changesResponses.add(changesPage(4, false,
+            change(1, "USER", "CREATE", 1,
+                "{\"id\":\"1\",\"op\":\"upsert\",\"type\":\"user\",\"email\":\"alice@acme.com\"}"),
+            change(2, "WORKSPACE", "CREATE", 20,
+                "{\"id\":\"20\",\"op\":\"upsert\",\"type\":\"workspace\",\"name\":\"ml-platform\"}"),
+            change(3, "GROUP", "CREATE", 10,
+                "{\"id\":\"10\",\"op\":\"upsert\",\"type\":\"group\",\"name\":\"engineering\"}")));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+
+        assertEquals("alice@acme.com", TestSupport.queryString(st,
+            "SELECT name FROM ollylake.main.\"user\" WHERE user_id = 1"));
+        assertEquals("ml-platform", workspaceName(20));
+        assertEquals("engineering", TestSupport.queryString(st,
+            "SELECT name FROM ollylake.main.\"group\" WHERE group_id = 10"));
+        assertEquals(CUST, TestSupport.queryLong(st,
+            "SELECT customer_id FROM ollylake.main.\"user\" WHERE user_id = 1"));
+    }
+
+    @Test
+    void capturesGenericSoftDeleteViaOp() throws SQLException {
+        bootstrap();   // seeds users 10, 20, 30
+
+        // A generic-shape entry whose payload says op:"delete" (no isDeleted) is
+        // a tombstone even when the action is not DELETE.
+        cursorsJson = cursorsPage(entry(2, 14), 3);
+        changesResponses.add(changesPage(15, false,
+            change(14, "USER", "UPDATE", 30,
+                "{\"id\":\"30\",\"op\":\"delete\",\"type\":\"user\"}")));
+        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+
+        assertEquals(2, count("ollylake.main.\"user\""));
+        assertEquals(0, TestSupport.count(st,
+            "(SELECT 1 FROM ollylake.main.\"user\" WHERE user_id = 30)"));
+    }
+
+    @Test
+    void reRunWhenIdleIsIdempotent() throws SQLException {
+        bootstrap();
+
+        // Nothing advanced in the registry: the second cycle is a no-op.
+        cursorsJson = "{\"entries\":[],\"nextOffset\":2,\"hasMore\":false}";
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(3, count("ollylake.main.\"user\""));
@@ -93,12 +126,13 @@ class SccalReferenceSyncCaptureTest {
     }
 
     @Test
-    void capturesAttributeUpdate() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+    void capturesAttributeUpdateFromStream() throws SQLException {
+        bootstrap();
         assertEquals("ws-2", workspaceName(2));
 
-        responses.put("workspace", "{\"1\":{\"workspaceId\":\"1\",\"name\":\"ws-1\"},"
-            + "\"2\":{\"workspaceId\":\"2\",\"name\":\"ws-renamed\"}}");   // upstream rename
+        cursorsJson = cursorsPage(entry(2, 14), 3);
+        changesResponses.add(changesPage(15, false,
+            change(14, "WORKSPACE", "UPDATE", 2, "{\"workspaceId\":\"2\",\"workspaceName\":\"ws-renamed\"}")));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals("ws-renamed", workspaceName(2));
@@ -106,55 +140,22 @@ class SccalReferenceSyncCaptureTest {
     }
 
     @Test
-    void capturesDeleteWhenRowDropsFromSnapshot() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-        assertEquals(2, count("ollylake.main.workspace"));
-
-        // Workspace 2 no longer present in the snapshot.
-        responses.put("workspace", "{\"1\":{\"workspaceId\":\"1\",\"name\":\"ws-1\"}}");
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(1, count("ollylake.main.workspace"));
-    }
-
-    @Test
     void capturesDeleteFromTombstone() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+        bootstrap();
+        assertEquals(2, count("ollylake.main.workspace"));
 
-        responses.put("workspace", "{\"1\":{\"workspaceId\":\"1\",\"name\":\"ws-1\"},"
-            + "\"2\":{\"workspaceId\":\"2\",\"name\":\"ws-2\",\"isDeleted\":true}}");
+        cursorsJson = cursorsPage(entry(2, 14), 3);
+        changesResponses.add(changesPage(15, false,
+            change(14, "WORKSPACE", "DELETE", 2, "{\"workspaceId\":\"2\"}")));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(1, count("ollylake.main.workspace"));
-    }
-
-    @Test
-    void emptySnapshotDoesNotDeleteExistingRows() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-        assertEquals(2, count("ollylake.main.workspace"));
-
-        // A degenerate-but-successful response: an empty snapshot for workspaces.
-        // Without the empty-stage guard this would delete both rows.
-        responses.put("workspace", "{}");
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(2, count("ollylake.main.workspace"));
-    }
-
-    @Test
-    void blankBodySnapshotDoesNotDeleteExistingRows() throws SQLException {
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-        assertEquals(2, count("ollylake.main.workspace"));
-
-        // Blank body is coalesced to "{}" by fetchAll, then guarded like any empty stage.
-        responses.put("workspace", "");
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(2, count("ollylake.main.workspace"));
     }
 
     @Test
     void pollCycleSurvivesFailureAndRecoversNextCycle() throws SQLException {
+        enqueueBootstrap();
+
         // A failing cycle (API returns 5xx) must not propagate out of pollCycle...
         stubStatus = 503;
         SccalReferenceSync.pollCycle(conn, st, http, "http://stub");
@@ -178,9 +179,70 @@ class SccalReferenceSyncCaptureTest {
 
     // ---- helpers -------------------------------------------------------------
 
+    /**
+     * Queue a single change-stream page that creates one row (or more) in every
+     * stream-fed reference table (USER, WORKSPACE, GROUP), and point /cursors at
+     * the registry head. Change ids 1..7 across the three entity types; the
+     * replay ends at offset 8. Payloads use the real ("sccal") field shape.
+     */
+    private void enqueueBootstrap() {
+        cursorsJson = cursorsPage(entry(1, 7), 2);
+        changesResponses.add(changesPage(8, false,
+            change(1, "WORKSPACE", "CREATE", 1, "{\"workspaceId\":\"1\",\"workspaceName\":\"ws-1\"}"),
+            change(2, "WORKSPACE", "CREATE", 2, "{\"workspaceId\":\"2\",\"workspaceName\":\"ws-2\"}"),
+            change(3, "USER", "CREATE", 10, "{\"userId\":\"10\",\"userName\":\"a@x.com\"}"),
+            change(4, "USER", "CREATE", 20, "{\"userId\":\"20\",\"userName\":\"b@x.com\"}"),
+            change(5, "USER", "CREATE", 30, "{\"userId\":\"30\",\"userName\":\"c@x.com\"}"),
+            change(6, "GROUP", "CREATE", 100, "{\"groupId\":\"100\",\"groupName\":\"Admins\"}"),
+            change(7, "GROUP", "CREATE", 101, "{\"groupId\":\"101\",\"groupName\":\"Devs\"}")));
+    }
+
+    /** Enqueue the bootstrap page and run one cycle. */
+    private void bootstrap() throws SQLException {
+        enqueueBootstrap();
+        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+    }
+
+    private static String change(long id, String entityType, String action, long entityId,
+                                 String sccal) {
+        return "{\"id\":\"" + id + "\",\"entityType\":\"" + entityType + "\",\"action\":\""
+            + action + "\",\"entityId\":\"" + entityId + "\",\"commitId\":\"1\","
+            + "\"changedAt\":\"2026-07-01T00:00:00Z\",\"sccal\":" + sccal + ",\"human\":{}}";
+    }
+
+    private static String entry(long seq, long lastChangeId) {
+        return "{\"seq\":\"" + seq + "\",\"customerId\":\"" + CUST + "\",\"tenantId\":\"" + TEN
+            + "\",\"lastChangeId\":\"" + lastChangeId + "\",\"updatedAt\":\"2026-07-01T00:00:00Z\"}";
+    }
+
+    private static String cursorsPage(String entry, long nextOffset) {
+        return "{\"entries\":[" + entry + "],\"startOffset\":1,\"limit\":1000,\"nextOffset\":"
+            + nextOffset + ",\"hasMore\":false}";
+    }
+
+    private static String changesPage(long nextOffset, boolean hasMore, String... entries) {
+        return "{\"entries\":[" + String.join(",", entries) + "],\"startOffset\":1,\"limit\":1000,"
+            + "\"nextOffset\":" + nextOffset + ",\"hasMore\":" + hasMore + "}";
+    }
+
     private HttpClient stubClient() {
-        return TestSupport.httpStub(req -> TestSupport.response(stubStatus,
-            responses.getOrDefault(TestSupport.objectTypeOf(req.uri()), "{}"), req.uri()));
+        return TestSupport.httpStub(req -> {
+            URI uri = req.uri();
+            if (stubStatus != 200) {
+                return TestSupport.response(stubStatus, "", uri);
+            }
+            String path = uri.getPath();
+            if (path.endsWith("/cursors")) {
+                return TestSupport.response(200, cursorsJson, uri);
+            }
+            if (path.endsWith("/changes")) {
+                Object next = changesResponses.isEmpty() ? "{}" : changesResponses.poll();
+                return next instanceof Integer status
+                    ? TestSupport.response(status, "", uri)
+                    : TestSupport.response(200, (String) next, uri);
+            }
+            throw new AssertionError("unexpected endpoint (only /cursors and /changes exist): " + path);
+        });
     }
 
     private long count(String table) throws SQLException {
