@@ -21,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * WORKSPACE, GROUP) — not just users — is populated from the change stream
  * ({@code /cursors} + {@code /changes}), each row stamped with its owning
  * customer_id; there is no {@code /list} snapshot path. Uses the project's
- * actual V1/V6/V7/V8 schema SQL.
+ * actual V6/V7/V8 schema SQL.
  */
 class SccalReferenceSyncCaptureTest {
 
@@ -44,7 +44,6 @@ class SccalReferenceSyncCaptureTest {
         conn = TestSupport.openLake();
         st = conn.createStatement();
         TestSupport.runSqlFile(st, "ollylake/init/V6__reference_tables.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V1__create_customer_tenant_ids_table.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
         http = stubClient();

@@ -20,16 +20,16 @@ import java.util.stream.Collectors;
 /**
  * Change-data-capture job for the analytics reference (dimension) tables.
  *
- * <p>Reads every {@code (customer_id, tenant_id)} pair from
- * {@code customer_tenant_reference} (the V1 table, stored in the DuckLake
- * catalog backed by MinIO), then captures the reference tables purely from the
- * SCCAL entity-change stream — the two polling endpoints
- * ({@code GET /internal/sccal/api/v1/cursors} and
- * {@code GET /internal/sccal/api/v1/changes}). There is no full-snapshot
- * ({@code /list}) path: every INSERT / UPDATE / DELETE comes from an explicit
- * change entry, so deletes are tombstones (never inferred from absence). See
- * {@link ChangeStreamSync} for the two-level poll, bootstrap (replay from the
- * start of a pair's stream) and 410-Gone (fast-forward past a pruned offset).
+ * <p>Captures the reference tables purely from the SCCAL entity-change stream —
+ * the two polling endpoints ({@code GET /internal/sccal/api/v1/cursors} and
+ * {@code GET /internal/sccal/api/v1/changes}). The {@code (customerId,
+ * tenantId)} pairs are discovered from the cursor registry itself
+ * ({@code /cursors}), so a new tenant is captured automatically the first time
+ * it appears there. There is no full-snapshot ({@code /list}) path: every
+ * INSERT / UPDATE / DELETE comes from an explicit change entry, so deletes are
+ * tombstones (never inferred from absence). See {@link ChangeStreamSync} for
+ * the two-level poll, first-contact bootstrap (replay from the start of a
+ * pair's stream) and 410-Gone (fast-forward past a pruned offset).
  *
  * <p>JSON is parsed by DuckDB itself (the raw response is bound as a {@code JSON}
  * parameter and shredded with {@code json_extract(...)}), so the job needs no
@@ -427,35 +427,15 @@ public final class SccalReferenceSync {
     }
 
     /**
-     * One full capture pass: drive the change stream for every tracked pair —
-     * {@code /cursors} discovery + per-tenant {@code /changes} deltas (usually a
-     * single cheap idle call), with a first-contact bootstrap that replays a
-     * pair's stream from the start. See {@link ChangeStreamSync}.
+     * One full capture pass: drive the change stream — {@code /cursors}
+     * discovery (which also defines the capture scope) + per-tenant
+     * {@code /changes} deltas (usually a single cheap idle call), with a
+     * first-contact bootstrap that replays a newly seen pair's stream from the
+     * start. See {@link ChangeStreamSync}.
      */
     static void runOnce(Connection conn, Statement st, HttpClient http,
                         String baseUrl) throws SQLException {
-        List<long[]> pairs = readCustomerTenantPairs(st);
-        if (pairs.isEmpty()) {
-            log.info("No (customerId, tenantId) pairs in customer_tenant_reference"
-                + " — nothing to capture.");
-            return;
-        }
-        ChangeStreamSync.run(conn, st, http, baseUrl, pairs);
-    }
-
-    // INVARIANT: this set of pairs defines the capture scope. Registry rows for
-    // pairs outside it are ignored (see ChangeStreamSync#inScope), so removing a
-    // pair here stops capturing its changes.
-    private static List<long[]> readCustomerTenantPairs(Statement st) throws SQLException {
-        List<long[]> pairs = new ArrayList<>();
-        try (ResultSet rs = st.executeQuery(
-            "SELECT customer_id, tenant_id FROM ollylake.main.customer_tenant_reference "
-                + "ORDER BY customer_id, tenant_id")) {
-            while (rs.next()) {
-                pairs.add(new long[] {rs.getLong(1), rs.getLong(2)});
-            }
-        }
-        return pairs;
+        ChangeStreamSync.run(conn, st, http, baseUrl);
     }
 
     // ---- small helpers -------------------------------------------------------

@@ -45,12 +45,8 @@ class ChangeStreamCaptureTest {
         conn = TestSupport.openLake();
         st = conn.createStatement();
         TestSupport.runSqlFile(st, "ollylake/init/V6__reference_tables.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V1__create_customer_tenant_ids_table.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
-        // Replace the V1 seed with a pair whose ids the stub JSON uses.
-        st.execute("DELETE FROM ollylake.main.customer_tenant_reference");
-        st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (" + CUST + ", " + TEN + ")");
 
         http = stubClient();
     }
@@ -74,22 +70,22 @@ class ChangeStreamCaptureTest {
 
         assertEquals(2, count(USER_TABLE));
         assertEquals(43, changeOffset());        // where the replay ended
-        assertEquals(6, registryOffset());       // full bootstrap → registry head
+        assertEquals(6, registryOffset());       // the registry page's nextOffset
         assertEquals(2, count(AUDIT_TABLE));     // the replayed entries are audited
     }
 
     @Test
-    void bootstrapWithEmptyStreamSeedsOffsetOne() throws SQLException {
-        // Registry lists the pair with no changes yet; /changes returns an empty
-        // page. The bootstrap seeds the cursor at the stream start (offset 1) and
-        // captures nothing — the next cycle picks up any later changes.
+    void emptyRegistryCapturesNothing() throws SQLException {
+        // The registry lists no pairs yet: nothing is known, so nothing is
+        // captured and no cursor state is written. First contact with a pair
+        // happens when it first appears in the registry.
         cursorsJson = "{\"entries\":[],\"nextOffset\":1,\"hasMore\":false}";
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(0, count(USER_TABLE));
-        assertEquals(1, changeOffset());
-        assertEquals(1, registryOffset());
+        assertEquals(0, count("ollylake.main.sccal_change_cursor"));
+        assertEquals(0, count("ollylake.main.sccal_registry_cursor"));
     }
 
     // ---- steady state -----------------------------------------------------------
@@ -246,8 +242,8 @@ class ChangeStreamCaptureTest {
 
     @Test
     void goneFastForwardsOnlyTheAffectedPair() throws SQLException {
-        // Two tracked pairs; both bootstrap in one run by replaying their streams.
-        st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (3, 4)");
+        // Two pairs in the registry; both bootstrap in one run by replaying
+        // their streams from the start.
         cursorsJson = cursorsPage(
             entry(5, CUST, TEN, 42) + "," + entry(6, 3, 4, 50), 7);
         changesResponses.add(changesPage(43, false,
@@ -338,19 +334,24 @@ class ChangeStreamCaptureTest {
         assertEquals(2, count(AUDIT_TABLE));             // both audited
     }
 
-    // ---- scoped bootstrap / failure isolation ----------------------------------
+    // ---- first-contact bootstrap / failure isolation ----------------------------
 
     @Test
-    void newPairBootstrapsWithoutWipingExistingCursors() throws SQLException {
+    void newPairInRegistryBootstrapsWithoutTouchingExistingCursors() throws SQLException {
         bootstrap();                                    // (CUST, TEN) at 43, registry at 6
 
-        st.execute("INSERT INTO ollylake.main.customer_tenant_reference VALUES (3, 4)");
-        // (3, 4) is missing → partial bootstrap; no /changes queued → empty replay.
+        // A never-seen pair appears in the registry: it has no saved cursor, so
+        // its stream replays from the start; the healthy pair's cursor stays put.
+        cursorsJson = cursorsPage(entry(7, 3, 4, 50), 8);
+        changesResponses.add(changesPage(51, false,
+            userChange(50, "CREATE", 99, "z@x.com", false)));
+
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(43, changeOffsetFor(CUST, TEN));   // healthy pair keeps its cursor
-        assertEquals(1, changeOffsetFor(3, 4));         // new pair: empty replay → offset 1
-        assertEquals(6, registryOffset());              // partial bootstrap leaves the registry offset
+        assertEquals(51, changeOffsetFor(3, 4));        // new pair: replayed from offset 1
+        assertTrue(userExists(99));
+        assertEquals(8, registryOffset());
     }
 
     @Test
@@ -365,29 +366,6 @@ class ChangeStreamCaptureTest {
 
         assertEquals(43, changeOffset());
         assertEquals(6, registryOffset());              // rolled back, not 8
-    }
-
-    @Test
-    void largeOutOfScopeBacklogAdvancesRegistryOffsetWhenIdle() throws SQLException {
-        bootstrap();                                    // registry at 6
-
-        // A full page of registry rows, all for an untracked pair: idle, but
-        // leaving the offset would re-page this backlog on every future poll.
-        StringBuilder entries = new StringBuilder();
-        for (int i = 0; i < 1000; i++) {
-            if (i > 0) {
-                entries.append(',');
-            }
-            entries.append(entry(100 + i, 9, 9, 5));
-        }
-        cursorsJson = "{\"entries\":[" + entries + "],\"startOffset\":1,\"limit\":1000,"
-            + "\"nextOffset\":1100,\"hasMore\":false}";
-
-        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
-
-        assertEquals(1100, registryOffset());           // paid one commit to skip the backlog
-        assertEquals(43, changeOffset());               // in-scope cursor untouched
-        assertEquals(2, count(USER_TABLE));             // nothing captured
     }
 
     @Test

@@ -15,7 +15,6 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.function.LongFunction;
 import java.util.stream.Collectors;
 
@@ -45,13 +44,18 @@ import java.util.stream.Collectors;
  * rows join it too — so a crash can only lose whole cycles (replayed
  * idempotently), never commit data without its cursor or vice versa.
  *
+ * <p>The registry itself defines the capture scope: every {@code (customerId,
+ * tenantId)} pair it reports is captured — there is no separate pair table to
+ * maintain, so a new tenant is picked up the first time it appears in the
+ * registry.
+ *
  * <p>There is no snapshot ({@code /list}) fallback. The two edge cases are
  * handled entirely from the stream:
  * <ul>
- *   <li><b>bootstrap</b> — a pair with no cursor row replays its change stream
- *       from the start ({@code startOffset = 1}) so CREATE/UPDATE/DELETE entries
- *       reconstruct current state; its cursor is then seeded from where the
- *       replay ended;</li>
+ *   <li><b>bootstrap</b> — a pair first seen in the registry with no saved
+ *       cursor replays its change stream from the start ({@code startOffset =
+ *       1}) so CREATE/UPDATE/DELETE entries reconstruct current state; its
+ *       cursor is then seeded from where the replay ended;</li>
  *   <li><b>410 Gone</b> — a saved offset fell below SCCAL's prune watermark; the
  *       stream can no longer replay it, so the cursor fast-forwards to the
  *       registry head and a warning is logged. Changes that occurred only inside
@@ -125,38 +129,19 @@ final class ChangeStreamSync {
         }
     }
 
-    /** One change-stream cycle for the given capture scope (see class doc). */
-    static void run(Connection conn, Statement st, HttpClient http, String baseUrl,
-                    List<long[]> pairs) throws SQLException {
+    /**
+     * One change-stream cycle (see class doc). Pairs are discovered from the
+     * registry itself: a reported pair with no saved cursor starts from offset 1
+     * (first-contact bootstrap), all others resume from their saved offset.
+     */
+    static void run(Connection conn, Statement st, HttpClient http, String baseUrl)
+            throws SQLException {
         Map<String, Long> offsets = readChangeOffsets(st);
-        List<long[]> missing = pairs.stream()
-            .filter(p -> !offsets.containsKey(key(p[0], p[1]))).toList();
-        if (!missing.isEmpty()) {
-            log.info("change stream: {} pair(s) without a cursor — bootstrapping by replaying"
-                + " each pair's change stream from the start", missing.size());
-            bootstrapPairs(conn, st, http, baseUrl, pairs, missing);
-            return;
-        }
-
         long seqOffset = readRegistryOffset(st);
         CursorPage page = fetchCursors(conn, http, baseUrl, seqOffset);
-        List<TenantCursor> advanced = dedupeByPair(inScope(page.entries(), pairs));
+        List<TenantCursor> advanced = dedupeByPair(page.entries());
         if (advanced.isEmpty()) {
-            // Nothing in scope advanced. A small out-of-scope backlog is
-            // deliberately NOT persisted — refetching a few rows next cycle is
-            // cheaper than a metadata-only lake commit. But once the backlog
-            // exceeds a page it would otherwise grow (and be re-paged) forever,
-            // so pay one commit to move the offset past it.
-            if (page.entries().size() >= PAGE_LIMIT) {
-                SqlScripts.inTransaction(conn, () -> {
-                    writeRegistryOffset(st, page.nextOffset());
-                    return true;
-                });
-                log.info("change stream: idle — advanced registry offset past {} out-of-scope"
-                    + " row(s)", page.entries().size());
-            } else {
-                log.info("change stream: idle (no tenant advanced past seq {})", seqOffset);
-            }
+            log.info("change stream: idle (no tenant advanced past seq {})", seqOffset);
             return;
         }
 
@@ -192,7 +177,7 @@ final class ChangeStreamSync {
                 if (c.lastChangeId() < from) {
                     continue;                     // registry row already consumed
                 }
-                long next = pullOrFastForward(conn, st, http, baseUrl, c, from, totals, false);
+                long next = pullOrFastForward(conn, st, http, baseUrl, c, from, totals);
                 if (next > from) {
                     writeChangeOffset(st, c.customerId(), c.tenantId(), next);
                     cursorMoved = true;
@@ -238,27 +223,19 @@ final class ChangeStreamSync {
      * committed in the caller's transaction and the cursor fast-forwards to the
      * registry head + 1. The pruned window is unrecoverable without a snapshot
      * endpoint — a change inside it is captured only when the entity next changes.
-     * The two callers (steady-state and {@code bootstrap}) differ only in the
-     * warning wording, selected by the flag. Returns the offset to save.
+     * Returns the offset to save.
      */
     private static long pullOrFastForward(Connection conn, Statement st, HttpClient http,
                                           String baseUrl, TenantCursor c, long from,
-                                          Counts totals, boolean bootstrap) throws SQLException {
+                                          Counts totals) throws SQLException {
         try {
             return pullChanges(conn, st, http, baseUrl, c, from, totals);
         } catch (GoneException gone) {
             long ff = c.lastChangeId() + 1;
-            if (bootstrap) {
-                log.warn("change stream: offset 1 pruned for customerId={}, tenantId={}"
-                    + " — bootstrapping at registry head {} (entities that changed only"
-                    + " before the prune watermark are not captured until they next change)",
-                    c.customerId(), c.tenantId(), ff);
-            } else {
-                log.warn("change stream: offset {} pruned for customerId={}, tenantId={}"
-                    + " — fast-forwarding to {} (changes inside the pruned window are lost"
-                    + " until the entity next changes)", gone.startOffset(),
-                    c.customerId(), c.tenantId(), ff);
-            }
+            log.warn("change stream: offset {} pruned for customerId={}, tenantId={}"
+                + " — fast-forwarding to {} (changes inside the pruned window are lost"
+                + " until the entity next changes)", gone.startOffset(),
+                c.customerId(), c.tenantId(), ff);
             return ff;
         }
     }
@@ -335,51 +312,6 @@ final class ChangeStreamSync {
                 }
             }
         }
-    }
-
-    // ---- bootstrap ------------------------------------------------------------
-
-    /**
-     * First-contact bootstrap for pairs with no cursor: replay each pair's
-     * change stream from the start ({@code startOffset = 1}) so its
-     * CREATE/UPDATE/DELETE entries reconstruct current state, then seed its
-     * cursor from where the replay ended. If offset 1 was already pruned
-     * upstream (410), fall back to the registry head and warn — the pre-prune
-     * history cannot be recovered without a snapshot endpoint.
-     *
-     * <p>On a fresh bootstrap (every pair new) the registry offset fast-forwards
-     * past the head so steady state doesn't re-page the rows just consumed; a
-     * partial bootstrap leaves it so healthy pairs' pending registry rows stay
-     * discoverable. The transaction always commits: seeding a cursor is real
-     * progress (it is what stops the next cycle re-bootstrapping) even when the
-     * stream carried no rows.
-     */
-    private static void bootstrapPairs(Connection conn, Statement st, HttpClient http, String baseUrl,
-                                       List<long[]> pairs, List<long[]> missing) throws SQLException {
-        CursorPage head = fetchCursors(conn, http, baseUrl, 1);
-        Map<String, Long> heads = new HashMap<>();
-        for (TenantCursor c : head.entries()) {
-            heads.merge(key(c.customerId(), c.tenantId()), c.lastChangeId(), Math::max);
-        }
-
-        SqlScripts.inTransaction(conn, () -> {
-            Counts totals = new Counts();
-            for (long[] pair : missing) {
-                long headId = heads.getOrDefault(key(pair[0], pair[1]), 0L);
-                TenantCursor c = new TenantCursor(pair[0], pair[1], headId);
-                long next = pullOrFastForward(conn, st, http, baseUrl, c, 1L, totals, true);
-                writeChangeOffset(st, pair[0], pair[1], next);
-            }
-            // Only fast-forward the registry offset on a full bootstrap; a partial
-            // one must leave healthy pairs' pending rows discoverable.
-            if (missing.size() == pairs.size()) {
-                writeRegistryOffset(st, head.nextOffset());
-            }
-            log.info("change stream: bootstrapped {} pair(s) from the stream — ins={} upd={}"
-                + " del={} audit={}", missing.size(), totals.inserted, totals.updated,
-                totals.deleted, totals.audited);
-            return true;
-        });
     }
 
     // ---- /cursors -------------------------------------------------------------
@@ -480,17 +412,6 @@ final class ChangeStreamSync {
     }
 
     // ---- small helpers ----------------------------------------------------------
-
-    /**
-     * Registry rows for pairs outside {@code customer_tenant_reference} are
-     * ignored: that table defines the capture scope (see the invariant on
-     * {@code readCustomerTenantPairs}).
-     */
-    private static List<TenantCursor> inScope(List<TenantCursor> entries, List<long[]> pairs) {
-        Set<String> scope = pairs.stream().map(p -> key(p[0], p[1])).collect(Collectors.toSet());
-        return entries.stream()
-            .filter(c -> scope.contains(key(c.customerId(), c.tenantId()))).toList();
-    }
 
     /**
      * Collapse duplicate registry rows per pair to the furthest advance, so a
