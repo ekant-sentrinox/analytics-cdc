@@ -92,9 +92,9 @@ Two edge cases are handled entirely from the stream (no snapshot fallback):
 
 Capture is **idempotent** — replaying a page inserts nothing new, and an idle
 poll (`/cursors` returns an empty page) costs one HTTP call and zero writes. The
-`objectType → /changes entityType` mapping lives in one place,
-`SccalReferenceSync.STREAM_ENTITY_TYPES`; `ChangeStreamSync.SYNCS_BY_ENTITY_TYPE`
-derives from it.
+captured tables — target table, `/changes` entityType, key/data columns and
+their JSON fields — are declared in one place, the `analytics_cdc.syncs` list in
+`application.conf`.
 
 ---
 
@@ -102,21 +102,24 @@ derives from it.
 
 ### Captured reference tables (V6)
 
-Every table below is fed from the `/changes` stream, keyed by its object type's
-`/changes` entityType. The stream only emits `USER`, `WORKSPACE` and `GROUP`
-entities, so those are the only object types captured. Each captured row is also
-stamped with the `customer_id` of the pair whose stream it came from — that value
-is not in the entity payload, it comes from the poll context.
+Every table below is fed from the `/changes` stream, keyed by the entityType its
+`analytics_cdc.syncs` entry declares (see [Configuration](#configuration)). Each
+captured row is also stamped with the `customer_id` of the pair whose stream it
+came from — that value is not in the entity payload, it comes from the poll
+context.
 
 | V6 table | `/changes` entityType | Key | `name` from | Notes |
 |---|---|---|---|---|
 | `"user"` | `USER` | `customer_id, userId` | `userName` (login email) | confirmed live payload shape |
 | `workspace` | `WORKSPACE` | `customer_id, workspaceId` | `workspaceName` | field names follow the USER convention (no live sample yet) |
-| `"group"` | `GROUP` | `customer_id, groupId` | `groupName` | field names follow the USER convention (no live sample yet) |
+| `"group"` | `USERGROUP` | `customer_id, userGroupId` | `groupName` | GroupServiceImpl publishes USERGROUP (never the GROUP enum value) |
+| `llm_access_rule` | `RULE` (ruleType 0/1) | `customer_id, ruleId` | `name` | RULE fans out by the payload's ruleType (`entry_filter` in config) |
+| `mcp_access_rule` | `RULE` (ruleType 2/3) | `customer_id, ruleId` | `name` | RULE fans out by the payload's ruleType (`entry_filter` in config) |
 
-All other V6 tables (`tenant`, `user_group_mapping`, `vkey`, `provider`,
-`mcp_server`, `mcp_access_rule`, `llm_access_rule`, `budget_rule`) have **no
-corresponding `/changes` entity type** and are created but left empty.
+All other V6 tables (`vkey`, `provider`, `mcp_server`, `budget_rule`) have
+**no corresponding `/changes` entity type** and are created but left empty.
+There is no tenant table: the `v_ai_audit` view (V9) serves `tenant_id`
+straight from the audit rows with a NULL `tenant_name`.
 
 ### Change-stream state and audit tables (V7 / V8)
 
@@ -138,15 +141,46 @@ describe:
 ```hocon
 analytics_cdc {
   sccal_base_url = "http://localhost:8080"   # env SCCAL_BASE_URL overrides
-  poll_interval  = 1m                        # env POLL_INTERVAL overrides
+  poll_interval  = 30s                       # env POLL_INTERVAL overrides
   startup_script_provider {
     script_location = "ollylake/startup.sql" # env STARTUP_SQL overrides
   }
+  syncs = [ ... ]                            # the captured tables — see below
 }
 ```
 
-`poll_interval` controls how the CDC runs: a **positive duration** (`1m` — the
-default, `30s`, `5 minutes`) polls — stay alive and re-capture on that interval,
+### Adding a new reference table (config only — no Java change)
+
+The captured tables are declared in the `analytics_cdc.syncs` list. To capture a
+new table:
+
+1. **Create the table** — add a `CREATE TABLE` to a new `ollylake/init/V*.sql`
+   migration (include `customer_id BIGINT NOT NULL` and partition by it, like
+   the existing V6 tables).
+2. **Declare the sync** — add one block to `analytics_cdc.syncs`:
+
+```hocon
+{
+  entity_type = "WIDGET"                  # the /changes entityType that feeds it
+  table = "ollylake.main.widget"          # quote reserved words: "ollylake.main.\"user\""
+  key_columns = [                         # identity columns (per-customer CDC key)
+    { column = "widget_id", json_fields = ["widgetId", "id"], type = "BIGINT" }
+  ]
+  data_columns = [                        # non-key attributes; may be omitted
+    { column = "name", json_fields = ["widgetName", "name"], type = "VARCHAR" }
+  ]
+  # entry_filter = "..."                  # optional: split one entityType across
+                                          # tables by payload content (see RULE)
+}
+```
+
+Each column lists its `json_fields` most-specific first; the capture coalesces
+them, taking the first field present in the payload. Declarations are validated
+at startup (identifier shapes, duplicate tables, statement splicing) and a bad
+entry fails fast rather than silently dropping a table from capture.
+
+`poll_interval` controls how the CDC runs: a **positive duration** (`30s` — the
+default, `1m`, `5 minutes`) polls — stay alive and re-capture on that interval,
 reusing the warm DuckDB connection; cycles that change nothing are rolled back
 (no empty snapshot) and a failed cycle is logged and retried on the next tick.
 **`0`** (or negative) runs one capture and exits.
@@ -169,7 +203,7 @@ set**: `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `S3_ENDPOINT`, `OLLYLAKE_BUCKET
 # Build + start the full chain: minio → minio-init → ollylake-init → analytics-cdc
 docker compose up --build
 
-# One-shot capture instead of the default 1m poll loop
+# One-shot capture instead of the default 30s poll loop
 POLL_INTERVAL=0 docker compose up analytics-cdc
 
 # Logs (prints an ins / upd / del count per table)

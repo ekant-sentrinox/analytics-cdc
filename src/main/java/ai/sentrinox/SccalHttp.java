@@ -1,19 +1,16 @@
 package ai.sentrinox;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 
 /**
  * Shared HTTP plumbing for the SCCAL JSON endpoints: client construction, the
  * request shape (timeouts, Accept header), the join/unwrap of async sends, and
- * the 200-with-coalesced-body contract both capture paths rely on. The one
- * home for these — neither sync class talks to {@link HttpClient} directly
- * beyond issuing sends.
+ * the 200-with-coalesced-body contract the capture path relies on.
  */
 final class SccalHttp {
 
@@ -36,17 +33,13 @@ final class SccalHttp {
 
     /** Blocking GET of {@code url}; transport failures surface as RuntimeException. */
     static HttpResponse<String> get(HttpClient http, String url) {
-        return join(http.sendAsync(jsonGet(url), HttpResponse.BodyHandlers.ofString()),
-            "GET " + url + " failed");
-    }
-
-    /** Join an async send, unwrapping the CompletionException into {@code message}. */
-    private static HttpResponse<String> join(CompletableFuture<HttpResponse<String>> inflight,
-                                             String message) {
         try {
-            return inflight.join();
-        } catch (CompletionException ce) {
-            throw new RuntimeException(message, ce.getCause() != null ? ce.getCause() : ce);
+            return http.send(jsonGet(url), HttpResponse.BodyHandlers.ofString());
+        } catch (IOException e) {
+            throw new RuntimeException("GET " + url + " failed", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("GET " + url + " interrupted", e);
         }
     }
 

@@ -4,6 +4,10 @@ target/
 !**/src/test/**/target/
 .kotlin
 
+# Local DuckDB state and shade-plugin output — never version these.
+*.ducklake
+dependency-reduced-pom.xml
+
 ### IntelliJ IDEA ###
 .idea/
 *.iml

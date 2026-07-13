@@ -33,17 +33,6 @@ final class DuckJson {
         }
     }
 
-    /** Single-row long out of a query whose one parameter is a raw JSON body. */
-    static long queryLong(Connection conn, String sql, String json) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, json);
-            try (ResultSet rs = ps.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
-        }
-    }
-
     /** Map every row of a query whose single parameter is a raw JSON body. */
     static <T> List<T> queryAll(Connection conn, String sql, String json, RowMapper<T> mapper)
             throws SQLException {

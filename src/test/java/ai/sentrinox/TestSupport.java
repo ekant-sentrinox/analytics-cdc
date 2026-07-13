@@ -11,7 +11,8 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.concurrent.CompletableFuture;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.function.Function;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -86,13 +87,82 @@ final class TestSupport {
         }
     }
 
-    /** Mockito HttpClient whose {@code sendAsync} answers each request via {@code router}. */
+    /** Mockito HttpClient whose {@code send} answers each request via {@code router}. */
     @SuppressWarnings("unchecked")
     static HttpClient httpStub(Function<HttpRequest, HttpResponse<String>> router) {
         HttpClient client = mock(HttpClient.class);
-        lenient().when(client.sendAsync(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
-            .thenAnswer(inv -> CompletableFuture.completedFuture(router.apply(inv.getArgument(0))));
+        try {
+            lenient().when(client.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenAnswer(inv -> router.apply(inv.getArgument(0)));
+        } catch (Exception impossible) {
+            // send() declares checked exceptions; stubbing never throws them.
+            throw new AssertionError(impossible);
+        }
         return client;
+    }
+
+    // ---- SCCAL endpoint stub + JSON page builders (shared by the capture tests) ----
+
+    /**
+     * Stub of the two SCCAL endpoints: {@code /cursors} answers from
+     * {@link #cursorsJson} (any startOffset); {@code /changes} answers from a
+     * FIFO of responses — a String is an HTTP 200 body, an Integer a bare
+     * status. A non-200 {@link #status} fails every endpoint (for
+     * failed-cycle tests).
+     */
+    static final class SccalStub {
+        String cursorsJson = "{}";
+        final Deque<Object> changesResponses = new ArrayDeque<>();
+        int status = 200;
+
+        HttpClient client() {
+            return httpStub(req -> {
+                URI uri = req.uri();
+                if (status != 200) {
+                    return response(status, "", uri);
+                }
+                String path = uri.getPath();
+                if (path.endsWith("/cursors")) {
+                    return response(200, cursorsJson, uri);
+                }
+                if (path.endsWith("/changes")) {
+                    Object next = changesResponses.isEmpty() ? "{}" : changesResponses.poll();
+                    return next instanceof Integer failure
+                        ? response(failure, "", uri)
+                        : response(200, (String) next, uri);
+                }
+                throw new AssertionError(
+                    "unexpected endpoint (only /cursors and /changes exist): " + path);
+            });
+        }
+    }
+
+    /** JSON for one /cursors registry entry. */
+    static String cursorEntry(long seq, long customerId, long tenantId, long lastChangeId) {
+        return "{\"seq\":\"" + seq + "\",\"customerId\":\"" + customerId + "\",\"tenantId\":\""
+            + tenantId + "\",\"lastChangeId\":\"" + lastChangeId + "\",\"lastActivationId\":\"9\","
+            + "\"updatedAt\":\"2026-07-01T00:00:00Z\"}";
+    }
+
+    /** One /cursors page (hasMore false) around the given entries CSV. */
+    static String cursorsPage(String entriesCsv, long nextOffset) {
+        return "{\"entries\":[" + entriesCsv + "],\"startOffset\":1,\"limit\":1000,\"nextOffset\":"
+            + nextOffset + ",\"hasMore\":false}";
+    }
+
+    /** One /changes page around the given entry JSONs. */
+    static String changesPage(long nextOffset, boolean hasMore, String... entries) {
+        return "{\"entries\":[" + String.join(",", entries) + "],\"startOffset\":1,\"limit\":1000,"
+            + "\"nextOffset\":" + nextOffset + ",\"hasMore\":" + hasMore + "}";
+    }
+
+    /** JSON for one /changes entry with the given sccal and human payloads. */
+    static String changeEntry(long id, String entityType, String action, long entityId,
+                              String sccalJson, String humanJson) {
+        return "{\"id\":\"" + id + "\",\"entityType\":\"" + entityType + "\",\"action\":\""
+            + action + "\",\"entityId\":\"" + entityId + "\",\"activationId\":\"77\","
+            + "\"txnId\":\"88\",\"changedAt\":\"2026-07-01T00:00:00Z\",\"changedBy\":\"99\","
+            + "\"sccal\":" + sccalJson + ",\"human\":" + humanJson + "}";
     }
 
     /** Canned HttpResponse with the given status, body and request URI. */

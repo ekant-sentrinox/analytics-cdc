@@ -98,11 +98,11 @@ services:
       - ./ollylake/startup.sql:/config/startup.sql:ro
 
   # ---------------------------------------------------------------------------
-  # analytics-cdc — Java program (ai.sentrinox.ReferenceCdc) that reads the
-  # (customerId, tenantId) pairs from customer_tenant_reference, calls the SCCAL
-  # internal-sync API for each reference object type and captures the changes
-  # (insert / update / delete) into the V6 reference tables. Runs after the
-  # tables have been created by ollylake-init.
+  # analytics-cdc — Java program (ai.sentrinox.SccalReferenceSync) that discovers
+  # the (customerId, tenantId) pairs from the SCCAL cursor registry (/cursors)
+  # and captures each pair's entity-change stream (insert / update / delete)
+  # into the V6 reference tables. Runs after the tables have been created by
+  # ollylake-init.
   # ---------------------------------------------------------------------------
   analytics-cdc:
     build:

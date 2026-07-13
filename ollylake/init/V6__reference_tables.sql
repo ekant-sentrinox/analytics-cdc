@@ -16,14 +16,6 @@
 -- NOTE: "user" and "group" are SQL reserved words and must always be quoted.
 -- =============================================================================
 
-CREATE TABLE IF NOT EXISTS ollylake.main.tenant (
-                                                    tenant_id   BIGINT  NOT NULL,
-                                                    customer_id BIGINT  NOT NULL,
-                                                    name        VARCHAR NOT NULL,
-                                                    is_deleted  BOOLEAN NOT NULL DEFAULT 0
-);
-ALTER TABLE ollylake.main.tenant SET PARTITIONED BY (customer_id);
-
 CREATE TABLE IF NOT EXISTS ollylake.main.workspace (
                                                        workspace_id    BIGINT  NOT NULL,
                                                        customer_id     BIGINT  NOT NULL,
@@ -48,13 +40,6 @@ CREATE TABLE IF NOT EXISTS ollylake.main."group" (
 );
 ALTER TABLE ollylake.main."group" SET PARTITIONED BY (customer_id);
 
-CREATE TABLE IF NOT EXISTS ollylake.main.user_group_mapping (
-                                                                user_id     BIGINT  NOT NULL,
-                                                                group_id    BIGINT  NOT NULL,
-                                                                customer_id BIGINT  NOT NULL,
-                                                                is_deleted  BOOLEAN NOT NULL DEFAULT 0
-);
-ALTER TABLE ollylake.main.user_group_mapping SET PARTITIONED BY (customer_id);
 
 CREATE TABLE IF NOT EXISTS ollylake.main.vkey (
 
