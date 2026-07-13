@@ -12,11 +12,12 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.LongFunction;
-import java.util.stream.Collectors;
 
 /**
  * Change-stream capture for every reference table via the two SCCAL polling
@@ -27,40 +28,32 @@ import java.util.stream.Collectors;
  *   GET /internal/sccal/api/v1/changes   — that tenant's entity_change entries from an offset
  * </pre>
  *
- * <p>Each cycle is a two-level poll. Level 1 asks the global cursor registry
- * for tenants whose stream advanced past our saved registry offset — an idle
+ * <p>Each cycle is a two-level poll: level 1 asks the global cursor registry
+ * for tenants whose stream advanced past our saved registry offset (an idle
  * system answers with one empty page and the cycle ends without touching the
- * lake. Level 2 pages {@code /changes} for each advanced tenant from its saved
- * per-tenant offset and applies the entries (explicit CREATE / UPDATE / DELETE
- * actions — no full-snapshot diffing).
+ * lake); level 2 pages {@code /changes} for each advanced tenant from its
+ * saved offset and applies the explicit CREATE / UPDATE / DELETE entries.
  *
- * <p>Every pulled {@code /changes} entry — all entity types, whether or not it
- * feeds a reference table — is also appended to the {@code entity_change_audit}
- * log ({@code V8}) with both payload views ({@code view=BOTH}: the minimal
- * sccal shape that drives the merge, and the full human response DTO).
+ * <p>Every pulled entry — whether or not it feeds a reference table — is also
+ * appended to the {@code entity_change_audit} log (V8) with both payload views
+ * ({@code view=BOTH}).
  *
- * <p>Both cursor positions are persisted in the lake ({@code V7} tables) and
- * written <b>in the same transaction as the data they describe</b> — the audit
- * rows join it too — so a crash can only lose whole cycles (replayed
- * idempotently), never commit data without its cursor or vice versa.
+ * <p>Both cursor positions are persisted in the lake (V7) and written <b>in the
+ * same transaction as the data they describe</b> — the audit rows join it too —
+ * so a crash can only lose whole cycles (replayed idempotently), never commit
+ * data without its cursor or vice versa.
  *
  * <p>The registry itself defines the capture scope: every {@code (customerId,
- * tenantId)} pair it reports is captured — there is no separate pair table to
- * maintain, so a new tenant is picked up the first time it appears in the
- * registry.
- *
- * <p>There is no snapshot ({@code /list}) fallback. The two edge cases are
- * handled entirely from the stream:
+ * tenantId)} pair it reports is captured, so a new tenant is picked up the
+ * first time it appears. There is no snapshot ({@code /list}) fallback; the
+ * two edge cases are handled entirely from the stream:
  * <ul>
- *   <li><b>bootstrap</b> — a pair first seen in the registry with no saved
- *       cursor replays its change stream from the start ({@code startOffset =
- *       1}) so CREATE/UPDATE/DELETE entries reconstruct current state; its
- *       cursor is then seeded from where the replay ended;</li>
- *   <li><b>410 Gone</b> — a saved offset fell below SCCAL's prune watermark; the
- *       stream can no longer replay it, so the cursor fast-forwards to the
- *       registry head and a warning is logged. Changes that occurred only inside
- *       the pruned window cannot be recovered and are captured only when the
- *       entity next changes.</li>
+ *   <li><b>bootstrap</b> — a pair with no saved cursor replays its change
+ *       stream from the start ({@code startOffset = 1}), reconstructing
+ *       current state;</li>
+ *   <li><b>410 Gone</b> — a saved offset fell below SCCAL's prune watermark,
+ *       so the cursor fast-forwards to the registry head. Changes only inside
+ *       the pruned window are captured when the entity next changes.</li>
  * </ul>
  */
 final class ChangeStreamSync {
@@ -70,20 +63,15 @@ final class ChangeStreamSync {
     private static final String CHANGE_CURSOR_TABLE = "ollylake.main.sccal_change_cursor";
     private static final String REGISTRY_CURSOR_TABLE = "ollylake.main.sccal_registry_cursor";
     private static final String AUDIT_TABLE = "ollylake.main.entity_change_audit";
+    private static final String ENTRIES_STAGE = SccalReferenceSync.ENTRIES_STAGE;
     private static final int PAGE_LIMIT = 1000;
 
     /**
-     * {@code /changes} entityType → the sync(s) it feeds — derived from
-     * {@link SccalReferenceSync#STREAM_ENTITY_TYPES}, the single declaration of
-     * the type→entityType mapping. Types with no entry (e.g. ACTIVATION) are
-     * ignored at staging (but still audited).
+     * Defensive ceiling per {@link #pageAll} call: an endpoint that keeps
+     * answering {@code hasMore:true} with advancing offsets must not loop one
+     * transaction forever — progress is saved and the pull resumes next cycle.
      */
-    static final Map<String, List<Sync>> SYNCS_BY_ENTITY_TYPE =
-        SccalReferenceSync.STREAM_ENTITY_TYPES.entrySet().stream()
-            .collect(Collectors.toUnmodifiableMap(
-                Map.Entry::getValue,
-                e -> SccalReferenceSync.SYNCS.stream()
-                    .filter(s -> s.objectType().equals(e.getKey())).toList()));
+    private static final int MAX_PAGES_PER_PULL = 10_000;
 
     /** One registry row: a tenant's position in its own change stream. */
     record TenantCursor(long customerId, long tenantId, long lastChangeId) {
@@ -152,18 +140,15 @@ final class ChangeStreamSync {
     /**
      * Pull and apply each advanced tenant's delta, then persist the moved
      * cursors — one transaction, one DuckLake snapshot. When every advanced
-     * row turns out to be already consumed, the transaction is rolled back:
-     * committing would write a metadata-only snapshot, the very thing the
-     * idle path avoids by not persisting the registry offset. But when the
-     * registry page was full ({@code pageFull}), the same escape as the idle
-     * path applies — without it a page-or-more backlog of already-consumed
-     * in-scope rows would pin the registry offset and be re-paged in full on
-     * every poll forever.
+     * row was already consumed, the transaction is rolled back (committing
+     * would write a metadata-only snapshot) — unless the registry page was
+     * full ({@code pageFull}), where the offset must advance anyway or a
+     * page-sized backlog of stale rows would pin it and be re-paged in full
+     * on every poll forever.
      *
-     * <p>A 410 on one tenant does not abort the cycle: the pages consumed before
-     * it stay committed, other tenants apply normally, and the affected pair's
-     * cursor fast-forwards past the pruned range (see class doc — the pruned
-     * changes cannot be recovered without a snapshot endpoint).
+     * <p>A 410 on one tenant does not abort the cycle: pages consumed before
+     * it stay committed, other tenants apply normally, and that pair's cursor
+     * fast-forwards past the pruned range.
      */
     private static void applyAdvancedTenants(Connection conn, Statement st, HttpClient http,
                                              String baseUrl, List<TenantCursor> advanced,
@@ -187,7 +172,8 @@ final class ChangeStreamSync {
             boolean changed = cursorMoved || totals.any();
             if (changed) {
                 log.info("change stream: {} tenant(s) advanced — ins={} upd={} del={} audit={}",
-                    advanced.size(), totals.inserted, totals.updated, totals.deleted, totals.audited);
+                    advanced.size(), totals.inserted, totals.updated,
+                    totals.deleted, totals.audited);
             } else if (pageFull) {
                 log.info("change stream: advanced row(s) already consumed — advanced registry"
                     + " offset past a full page of stale rows");
@@ -212,18 +198,17 @@ final class ChangeStreamSync {
         return pageAll(conn, http, urlPrefix, from,
             offset -> new GoneException(c.customerId(), c.tenantId(), offset),
             body -> {
-                totals.audited += auditChangePage(conn, c, body, from);
-                applyChangePage(conn, st, body, c.customerId(), totals);
+                stageEntries(conn, st, body);
+                totals.audited += auditStagedEntries(st, c, from);
+                applyStagedEntries(st, c.customerId(), totals);
             });
     }
 
     /**
-     * {@link #pullChanges} for one tenant with the shared 410-Gone recovery: if
-     * the saved offset was pruned upstream, the pages applied before the 410 stay
-     * committed in the caller's transaction and the cursor fast-forwards to the
-     * registry head + 1. The pruned window is unrecoverable without a snapshot
-     * endpoint — a change inside it is captured only when the entity next changes.
-     * Returns the offset to save.
+     * {@link #pullChanges} with the 410-Gone recovery: pages applied before
+     * the 410 stay committed and the cursor fast-forwards to the registry
+     * head + 1 (the pruned window is unrecoverable without a snapshot
+     * endpoint). Returns the offset to save.
      */
     private static long pullOrFastForward(Connection conn, Statement st, HttpClient http,
                                           String baseUrl, TenantCursor c, long from,
@@ -241,75 +226,96 @@ final class ChangeStreamSync {
     }
 
     /**
-     * Append one page's entries — ALL entity types, applied or not — to the
-     * audit log; returns the number of rows appended. Joins the caller's open
-     * transaction, so an audit row commits with the merge (and the cursor) it
-     * belongs to. Idempotent: a replayed page's entries hit the
-     * {@code (customer_id, tenant_id, change_id)} NOT EXISTS guard, bounded
+     * Append the staged page's entries — all entity types, applied or not — to
+     * the audit log inside the caller's transaction; returns rows appended.
+     * Idempotent: replayed entries hit the change_id NOT EXISTS guard, bounded
      * below by {@code minChangeId} (the pull's start offset — no entry in the
      * page can have a smaller id) so the anti-join prunes the ever-growing
      * audit log instead of scanning all of it.
      *
-     * <p>Numeric/timestamp fields use TRY_CAST and entries missing a NOT NULL
-     * audit column (id, entityType, action) are skipped with a warning: one
-     * malformed entry must not abort the transaction — that would pin the
-     * cursor and refail on the same page every cycle.
+     * Entries missing a NOT NULL audit column are skipped with a warning —
+     * one malformed entry must not abort the transaction (that would pin the
+     * cursor and refail on the same page every cycle).
      */
-    private static int auditChangePage(Connection conn, TenantCursor c, String body,
-                                       long minChangeId) throws SQLException {
-        // The fields are materialized in an inner projection before the guards
-        // apply: combining several `entry->>'f' IS NULL` predicates directly
-        // over the unnest column trips a DuckDB (1.4.5) planner conversion bug.
-        String shredded = "SELECT TRY_CAST(entry->>'id' AS BIGINT) AS change_id,"
-            + " entry->>'entityType' AS entity_type,"
-            + " TRY_CAST(entry->>'entityId' AS BIGINT) AS entity_id,"
-            + " entry->>'action' AS action,"
-            + " TRY_CAST(entry->>'commitId' AS BIGINT) AS commit_id,"
-            + " TRY_CAST(entry->>'changedAt' AS TIMESTAMPTZ) AS changed_at,"
-            + " entry->>'sccal' AS sccal_payload, entry->>'human' AS human_payload"
-            + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS entry)";
-        long malformed = DuckJson.queryLong(conn,
-            "SELECT count(*) FROM (" + shredded + ")"
-                + " WHERE change_id IS NULL OR entity_type IS NULL OR action IS NULL", body);
+    private static int auditStagedEntries(Statement st, TenantCursor c, long minChangeId)
+            throws SQLException {
+        long malformed = queryLong(st, "SELECT count(*) FROM " + ENTRIES_STAGE
+            + " WHERE change_id IS NULL OR entity_type IS NULL OR action IS NULL");
         if (malformed > 0) {
             log.warn("change stream: {} malformed /changes entr(y/ies) for customerId={},"
                     + " tenantId={} skipped (missing id/entityType/action) — not auditable"
                     + " or applicable", malformed, c.customerId(), c.tenantId());
         }
-        String sql = "INSERT INTO " + AUDIT_TABLE
+        return st.executeUpdate("INSERT INTO " + AUDIT_TABLE
             + " (change_id, customer_id, tenant_id, entity_type, entity_id, action,"
-            + " commit_id, changed_at, sccal_payload, human_payload)"
+            + " activation_id, txn_id, changed_at, changed_by, sccal_payload, human_payload)"
             + " SELECT change_id, " + c.customerId() + ", " + c.tenantId() + ","
-            + " entity_type, entity_id, action, commit_id, changed_at,"
-            + " sccal_payload, human_payload"
-            + " FROM (" + shredded + ") e"
+            + " entity_type, entity_id, action, activation_id, txn_id, changed_at,"
+            + " changed_by, sccal_payload, human_payload"
+            + " FROM " + ENTRIES_STAGE + " e"
             + " WHERE e.change_id IS NOT NULL AND e.entity_type IS NOT NULL"
             + " AND e.action IS NOT NULL"
             + " AND NOT EXISTS (SELECT 1 FROM " + AUDIT_TABLE + " a"
             + " WHERE a.customer_id = " + c.customerId()
             + " AND a.tenant_id = " + c.tenantId()
             + " AND a.change_id >= " + minChangeId
-            + " AND a.change_id = e.change_id)";
-        return DuckJson.executeWithJson(conn, sql, body);
+            + " AND a.change_id = e.change_id)");
     }
 
     /**
-     * Stage one page's entries per fed sync and apply them (DELETE / UPDATE /
-     * INSERT). {@code customerId} (the pair being pulled) is stamped onto every
-     * staged row — it scopes the target table and is not in the entity payload.
+     * Shred one raw /changes body into {@link SccalReferenceSync#ENTRIES_STAGE}
+     * — the page's single JSON parse; the audit insert and every sync's staging
+     * read the parsed rows instead of each re-shredding the body. TRY_CAST
+     * throughout: a malformed field becomes NULL (skipped downstream), never an
+     * aborted transaction. The raw {@code entry} is kept for the config
+     * {@code entry_filter} predicates written against it.
+     *
+     * <p>The shred is a bare projection on purpose — predicates over
+     * {@code entry->>'f'} combined with the unnest column in one query trip a
+     * DuckDB planner conversion bug (verified still present on 1.5.4) — so all
+     * filtering happens downstream against the materialized columns.
      */
-    private static void applyChangePage(Connection conn, Statement st, String body,
-                                        long customerId, Counts totals) throws SQLException {
-        for (Map.Entry<String, List<Sync>> byType : SYNCS_BY_ENTITY_TYPE.entrySet()) {
-            for (Sync s : byType.getValue()) {
-                st.execute(s.createChangeStageSql());
-                int staged = DuckJson.executeWithJson(conn, s.stageChangesSql(byType.getKey(), customerId), body);
-                // A page usually carries one entityType, so most syncs stage
-                // nothing; the dedupe + DELETE/UPDATE/INSERT would all be no-ops
-                // (adding {0,0,0}), so skip them when this sync staged no rows.
-                if (staged > 0) {
-                    totals.addMerge(s.applyChanges(st));
-                }
+    private static void stageEntries(Connection conn, Statement st, String body)
+            throws SQLException {
+        st.execute("CREATE OR REPLACE TEMP TABLE " + ENTRIES_STAGE + " (change_id BIGINT,"
+            + " entity_type VARCHAR, entity_id BIGINT, action VARCHAR, activation_id BIGINT,"
+            + " txn_id BIGINT, changed_at TIMESTAMPTZ, changed_by BIGINT,"
+            + " sccal_payload VARCHAR, human_payload VARCHAR, entry JSON)");
+        DuckJson.executeWithJson(conn, "INSERT INTO " + ENTRIES_STAGE
+            + " SELECT TRY_CAST(entry->>'id' AS BIGINT), entry->>'entityType',"
+            + " TRY_CAST(entry->>'entityId' AS BIGINT), entry->>'action',"
+            + " TRY_CAST(entry->>'activationId' AS BIGINT),"
+            + " TRY_CAST(entry->>'txnId' AS BIGINT),"
+            + " TRY_CAST(entry->>'changedAt' AS TIMESTAMPTZ),"
+            + " TRY_CAST(entry->>'changedBy' AS BIGINT),"
+            + " entry->>'sccal', entry->>'human', entry"
+            + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS entry)", body);
+    }
+
+    /**
+     * Stage and apply the staged page's entries per fed sync (DELETE / UPDATE /
+     * INSERT). Only syncs whose entityType is present in the page are touched —
+     * a page usually carries one type, so most syncs cost nothing.
+     * {@code customerId} (the pair being pulled) is stamped onto every staged
+     * row — it scopes the target table and is not in the entity payload.
+     */
+    private static void applyStagedEntries(Statement st, long customerId, Counts totals)
+            throws SQLException {
+        Set<String> present = new HashSet<>();
+        try (ResultSet rs = st.executeQuery("SELECT DISTINCT entity_type FROM "
+            + ENTRIES_STAGE + " WHERE entity_type IS NOT NULL")) {
+            while (rs.next()) {
+                present.add(rs.getString(1));
+            }
+        }
+        for (Sync s : SccalReferenceSync.SYNCS) {
+            if (!present.contains(s.entityType())) {
+                continue;
+            }
+            st.execute(s.createChangeStageSql());
+            int staged = st.executeUpdate(s.stageChangesSql(customerId));
+            if (staged > 0) {
+                totals.addMerge(s.applyChanges(st));
             }
         }
     }
@@ -333,11 +339,9 @@ final class ChangeStreamSync {
     }
 
     /**
-     * Drive one offset-paged SCCAL endpoint: GET
-     * {@code urlPrefix + "startOffset=…&limit=…"} from {@code startOffset}
-     * until {@code hasMore} is false, feeding each body to {@code handler};
-     * returns the offset to save (the final {@code nextOffset}). A page that
-     * makes no progress ({@code nextOffset <= offset}) stops the paging
+     * Drive one offset-paged SCCAL endpoint from {@code startOffset} until
+     * {@code hasMore} is false, feeding each body to {@code handler}; returns
+     * the offset to save. A page that makes no progress stops the paging
      * defensively. {@code on410}, when non-null, maps the current offset to
      * the exception thrown on HTTP 410; otherwise 410 fails like any non-200.
      */
@@ -345,7 +349,7 @@ final class ChangeStreamSync {
                                 long startOffset, LongFunction<RuntimeException> on410,
                                 PageHandler handler) throws SQLException {
         long offset = startOffset;
-        while (true) {
+        for (int pages = 0; pages < MAX_PAGES_PER_PULL; pages++) {
             String url = urlPrefix + "startOffset=" + offset + "&limit=" + PAGE_LIMIT;
             HttpResponse<String> resp = SccalHttp.get(http, url);
             if (on410 != null && resp.statusCode() == 410) {
@@ -362,14 +366,27 @@ final class ChangeStreamSync {
                 return offset;
             }
         }
+        log.warn("change stream: paging stopped after {} pages without hasMore=false"
+            + " ({}) — progress saved, resuming next cycle", MAX_PAGES_PER_PULL, urlPrefix);
+        return offset;
     }
 
-    /** Shred one /cursors page with DuckDB (ids arrive as JSON strings), in seq order. */
+    /**
+     * Shred one /cursors page with DuckDB (ids arrive as JSON strings), in seq
+     * order. TRY_CAST + filter: a malformed registry row is skipped, not a
+     * crashed cycle refailing on every poll. The fields materialize in an
+     * inner projection before the WHERE — predicates directly over the unnest
+     * column trip the DuckDB planner conversion bug.
+     */
     private static List<TenantCursor> parseCursors(Connection conn, String body) throws SQLException {
-        String sql = "SELECT (e->>'customerId')::BIGINT, (e->>'tenantId')::BIGINT,"
-            + " coalesce((e->>'lastChangeId')::BIGINT, 0)"
-            + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS e)"
-            + " ORDER BY (e->>'seq')::BIGINT";
+        String sql = "SELECT customer_id, tenant_id, coalesce(last_change_id, 0) FROM ("
+            + "SELECT TRY_CAST(e->>'customerId' AS BIGINT) AS customer_id,"
+            + " TRY_CAST(e->>'tenantId' AS BIGINT) AS tenant_id,"
+            + " TRY_CAST(e->>'lastChangeId' AS BIGINT) AS last_change_id,"
+            + " TRY_CAST(e->>'seq' AS BIGINT) AS seq"
+            + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS e))"
+            + " WHERE customer_id IS NOT NULL AND tenant_id IS NOT NULL"
+            + " ORDER BY seq";
         return DuckJson.queryAll(conn, sql, body,
             rs -> new TenantCursor(rs.getLong(1), rs.getLong(2), rs.getLong(3)));
     }
@@ -414,10 +431,8 @@ final class ChangeStreamSync {
     // ---- small helpers ----------------------------------------------------------
 
     /**
-     * Collapse duplicate registry rows per pair to the furthest advance, so a
-     * tenant that advanced several times since our offset is pulled once, not
-     * once per registry row (each re-pull would restart from the same saved
-     * offset and redo the whole range).
+     * Collapse duplicate registry rows per pair to the furthest advance — each
+     * re-pull would restart from the same saved offset and redo the range.
      */
     private static List<TenantCursor> dedupeByPair(List<TenantCursor> entries) {
         Map<String, TenantCursor> byPair = new LinkedHashMap<>();
@@ -430,6 +445,14 @@ final class ChangeStreamSync {
 
     private static String key(long customerId, long tenantId) {
         return customerId + ":" + tenantId;
+    }
+
+    /** First column of the query's first row as a long; the row must exist. */
+    private static long queryLong(Statement st, String sql) throws SQLException {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            rs.next();
+            return rs.getLong(1);
+        }
     }
 
     private ChangeStreamSync() {

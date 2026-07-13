@@ -13,6 +13,7 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <duckdb.version>1.5.4.0</duckdb.version>
+        <dazzleduck.version>0.2.11-SNAPSHOT</dazzleduck.version>
     </properties>
 
     <dependencies>
@@ -51,7 +52,7 @@
         <dependency>
             <groupId>io.dazzleduck.sql</groupId>
             <artifactId>dazzleduck-sql-common</artifactId>
-            <version>0.2.10-SNAPSHOT</version>
+            <version>${dazzleduck.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>org.apache.arrow</groupId>
@@ -117,6 +118,9 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <!-- Standalone app — nobody consumes our pom, so skip
+                                 the generated dependency-reduced-pom.xml. -->
+                            <createDependencyReducedPom>false</createDependencyReducedPom>
                             <transformers>
                                 <transformer
                                         implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">

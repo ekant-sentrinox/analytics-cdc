@@ -13,31 +13,24 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Change-data-capture job for the analytics reference (dimension) tables.
+ * Change-data-capture job for the analytics reference (dimension) tables,
+ * captured purely from the SCCAL entity-change stream — deletes are explicit
+ * tombstones, there is no full-snapshot ({@code /list}) path. The capture
+ * mechanics (two-level poll, first-contact bootstrap, 410 recovery) live in
+ * {@link ChangeStreamSync}; this class owns the process lifecycle and the
+ * config-declared table definitions ({@link Sync}).
  *
- * <p>Captures the reference tables purely from the SCCAL entity-change stream —
- * the two polling endpoints ({@code GET /internal/sccal/api/v1/cursors} and
- * {@code GET /internal/sccal/api/v1/changes}). The {@code (customerId,
- * tenantId)} pairs are discovered from the cursor registry itself
- * ({@code /cursors}), so a new tenant is captured automatically the first time
- * it appears there. There is no full-snapshot ({@code /list}) path: every
- * INSERT / UPDATE / DELETE comes from an explicit change entry, so deletes are
- * tombstones (never inferred from absence). See {@link ChangeStreamSync} for
- * the two-level poll, first-contact bootstrap (replay from the start of a
- * pair's stream) and 410-Gone (fast-forward past a pruned offset).
+ * <p>JSON is parsed by DuckDB itself (bodies bound as {@code JSON} parameters
+ * and shredded with {@code json_extract}), so the job needs no JSON library.
  *
- * <p>JSON is parsed by DuckDB itself (the raw response is bound as a {@code JSON}
- * parameter and shredded with {@code json_extract(...)}), so the job needs no
- * JSON library beyond the DuckDB driver already on the classpath.
- *
- * <p>With {@code analytics_cdc.poll_interval = 0} (default) it runs one capture
- * and exits. A positive interval keeps the process alive and re-captures on that
- * interval, reusing the warm DuckDB connection and surviving per-cycle failures.
+ * <p>A zero {@code analytics_cdc.poll_interval} runs one capture and exits; a
+ * positive interval polls forever, reusing the warm DuckDB connection and
+ * surviving per-cycle failures.
  *
  * <p>Run with: {@code java -cp analytics-cdc.jar ai.sentrinox.SccalReferenceSync}
  */
@@ -48,27 +41,28 @@ public final class SccalReferenceSync {
     static final String API_PATH = "/internal/sccal/api/v1/";
 
     /**
-     * One column of a reference table and how to pull it out of an entity.
-     *
-     * <p>A column may map to more than one JSON field. The {@code /changes}
-     * stream carries two payload conventions in the same feed — a generic shape
-     * ({@code id}, {@code name}, {@code email}) and the real Sentrinox shape
-     * ({@code userId}, {@code userName}, ...) — so the extraction coalesces the
-     * alternatives (declared most-specific first) and takes the first present.
+     * Per-page temp table of shredded /changes entries — created and loaded
+     * once per page by {@link ChangeStreamSync} (one JSON parse), then read by
+     * the audit insert and every sync's staging instead of each re-parsing the
+     * raw body. Keeps the raw {@code entry} column so config
+     * {@code entry_filter} predicates written against it still apply.
+     */
+    static final String ENTRIES_STAGE = "cdc_entries";
+
+    /**
+     * One column of a reference table and the JSON field(s) it is pulled from.
+     * The {@code /changes} stream mixes two payload conventions (the real
+     * Sentrinox shape — {@code userId}, {@code userName} — and a generic
+     * {@code id}/{@code name}/{@code email} shape), so extraction coalesces
+     * the declared fields, most-specific first.
      */
     private record Col(String column, List<String> jsonFields, String sqlType) {
-        Col(String column, String jsonField, String sqlType) {
-            this(column, List.of(jsonField), sqlType);
-        }
 
         /**
-         * Raw text extraction from entity alias {@code e}, aliased to the target
-         * column — no cast. Materialized in an inner projection so the typed
-         * {@link #castExpr()} in the outer projection references a plain column
-         * rather than {@code e}: mixing {@code (e->>'f')::TYPE} casts with the
-         * delete-normalising CASE (which also reads {@code e}) in one projection
-         * trips a DuckDB (1.4.5) planner conversion bug — the same one the audit
-         * shredder sidesteps.
+         * Raw text extraction from entity alias {@code e}, aliased to the
+         * target column, no cast — the cast happens in a separate outer
+         * projection ({@link #castExpr()}); see {@link Sync#stageChangesSql}
+         * for the DuckDB planner bug that split sidesteps.
          */
         String rawExpr() {
             String extract = jsonFields.size() == 1
@@ -77,31 +71,40 @@ public final class SccalReferenceSync {
             return extract + " AS " + column;
         }
 
-        /** Cast the materialized raw column (see {@link #rawExpr()}) to its SQL type. */
+        /**
+         * TRY_CAST the materialized raw column (see {@link #rawExpr()}) to its
+         * SQL type. TRY_CAST, not a hard cast: a malformed value (e.g. a
+         * non-numeric id) becomes NULL and flows into the poison-entry skip
+         * path — a hard cast would abort the transaction with the cursor
+         * unmoved and refail on the same page every cycle.
+         */
         String castExpr() {
-            return column + "::" + sqlType + " AS " + column;
+            return "TRY_CAST(" + column + " AS " + sqlType + ") AS " + column;
         }
     }
 
     /**
-     * A reference table fed from one SCCAL object type, with the SQL needed to
-     * stage and capture it from the change stream.
+     * A reference table fed from one SCCAL {@code /changes} entityType, with
+     * the SQL to stage and capture it from the change stream. Built from config
+     * ({@code analytics_cdc.syncs} — see application.conf) by {@link #loadSyncs}.
      *
-     * <p>Every target table also carries a {@code customer_id}. It is not in the
-     * entity payload — it comes from the poll context (the customer whose stream
-     * is being pulled) — so it is staged as a literal and is part of the CDC key,
-     * scoping every match to the owning customer (the tables are also
-     * {@code PARTITIONED BY (customer_id)}).
+     * <p>Every target table also carries a {@code customer_id}. It is not in
+     * the entity payload — it comes from the poll context — so it is staged as
+     * a literal and is part of the CDC key, scoping every match to the owning
+     * customer.
      *
-     * @param objectType SCCAL object type ({@code user}, {@code workspace},
-     *                   {@code group}); the {@code /changes} entityType it maps
-     *                   to is declared in {@link #STREAM_ENTITY_TYPES}
-     * @param table      target table, already schema-qualified and quoted
-     * @param keyCols    identity columns (the per-customer CDC key)
-     * @param dataCols   non-key attribute columns (e.g. name)
+     * @param entityType     {@code /changes} entityType that feeds the table;
+     *                       several syncs may share one (split by
+     *                       {@code entryFilterSql})
+     * @param table          target table, schema-qualified and quoted
+     * @param keyCols        identity columns (the per-customer CDC key)
+     * @param dataCols       non-key attribute columns; may be empty
+     * @param entryFilterSql extra SQL predicate over the raw {@code entry}
+     *                       JSON, ANDed with the entityType match; {@code null}
+     *                       when entityType alone is enough
      */
-    record Sync(String objectType, String table, List<Col> keyCols,
-                List<Col> dataCols) {
+    record Sync(String entityType, String table, List<Col> keyCols,
+                List<Col> dataCols, String entryFilterSql) {
 
         private List<Col> allCols() {
             List<Col> all = new ArrayList<>(keyCols);
@@ -113,11 +116,7 @@ public final class SccalReferenceSync {
             return prefix + table.replaceAll("[^A-Za-z0-9]", "_");
         }
 
-        /**
-         * {@code t.customer_id = s.customer_id AND t.k1 = s.k1 ...} — the
-         * staging-vs-target key match, always scoped by customer_id so a row is
-         * only ever matched within its owning customer.
-         */
+        /** Staging-vs-target key match, always scoped by customer_id. */
         private String keyEq() {
             return "t.customer_id = s.customer_id AND "
                 + join(keyCols, c -> "t." + c.column() + " = s." + c.column(), " AND ");
@@ -152,45 +151,39 @@ public final class SccalReferenceSync {
         }
 
         /**
-         * Parameterised: bind one raw /changes response body as parameter 1.
-         * Stages the page's entries of {@code entityType}, pulling the columns
-         * out of each entry's {@code sccal} payload — aliased {@code e} — and
-         * stamping {@code customerId} (the poll context, not in the payload) as a
-         * literal on every row.
+         * Stage this sync's rows of the current page from the shared
+         * {@link #ENTRIES_STAGE} (already shredded — no JSON parse here):
+         * columns pulled from each entry's {@code sccal} payload (alias
+         * {@code e}), {@code customerId} stamped as a literal. A non-DELETE
+         * action whose payload says {@code isDeleted:true} or
+         * {@code op:"delete"} — a soft-delete modelled as an update — is
+         * normalised to a tombstone.
          *
-         * <p>Delete semantics: a non-DELETE action whose payload says
-         * {@code isDeleted:true} (the real shape) or {@code op:"delete"} (the
-         * generic shape) — a soft-delete modelled as an update — is normalised
-         * to a tombstone, so it removes the row rather than being applied as an
-         * update.
-         *
-         * <p>Two projections over {@code e}: the inner one materializes every
-         * field access ({@code isDeleted}, {@code op} and each column) as a raw
-         * text column ({@link Col#rawExpr()}); the outer one applies the typed
-         * casts ({@link Col#castExpr()}) and the delete-normalising CASE against
-         * those plain columns, never {@code e}. Mixing the {@code ::TYPE} casts
-         * and the CASE in one projection over {@code e} trips a DuckDB (1.4.5)
-         * planner conversion bug — the same one the audit shredder sidesteps.
+         * <p>Two projections on purpose: the inner one materializes every
+         * field access as raw text, the outer one applies the typed casts and
+         * the tombstone CASE against those plain columns, never {@code e}.
+         * Mixing the casts and the CASE in one projection over {@code e} trips
+         * a DuckDB planner conversion bug when an entry is missing fields
+         * (verified still present on 1.5.4) — the same one the entries shred
+         * sidesteps.
          */
-        String stageChangesSql(String entityType, long customerId) {
+        String stageChangesSql(long customerId) {
             return "INSERT INTO " + changeStage() + " (customer_id, " + columns(allCols())
                 + ", __action, __change_id) SELECT " + customerId + ", "
                 + join(allCols(), Col::castExpr, ", ")
-                + ", CASE WHEN coalesce(__is_deleted::BOOLEAN, false) OR __op = 'delete'"
+                + ", CASE WHEN coalesce(TRY_CAST(__is_deleted AS BOOLEAN), false) OR __op = 'delete'"
                 + " THEN 'DELETE' ELSE action END AS __action, __change_id FROM ("
                 + "SELECT " + join(allCols(), Col::rawExpr, ", ")
                 + ", e->>'isDeleted' AS __is_deleted, e->>'op' AS __op,"
                 + " action, __change_id FROM ("
-                + "SELECT entry->'sccal' AS e, entry->>'action' AS action,"
-                + " (entry->>'id')::BIGINT AS __change_id"
-                + " FROM (SELECT unnest(json_extract(?::JSON, '$.entries[*]')) AS entry)"
-                + " WHERE entry->>'entityType' = '" + entityType + "'))";
+                + "SELECT entry->'sccal' AS e, action, change_id AS __change_id, entry"
+                + " FROM " + ENTRIES_STAGE + " WHERE entity_type = '" + entityType + "'"
+                + (entryFilterSql == null ? "" : " AND (" + entryFilterSql + ")") + "))";
         }
 
         /**
-         * Collapse to the LAST event per key (highest change id) — a page can
-         * carry several events for one key (e.g. CREATE then DELETE) and only
-         * the final state may be applied.
+         * Collapse to the last event per key — a page can carry several events
+         * for one key (CREATE then DELETE) and only the final state may apply.
          */
         String changeDedupeSql() {
             return "CREATE OR REPLACE TEMP TABLE " + changeStage() + " AS SELECT * FROM " + changeStage()
@@ -222,25 +215,31 @@ public final class SccalReferenceSync {
         }
 
         /**
-         * Apply one staged /changes page (dedupe, then DELETE / UPDATE / INSERT);
-         * returns {inserted, updated, deleted}. Replays are idempotent: a re-seen
-         * CREATE hits NOT EXISTS, a re-seen UPDATE fails the changed predicate,
-         * a re-seen DELETE matches nothing.
+         * Apply one staged /changes page (dedupe, then DELETE / UPDATE /
+         * INSERT); returns {inserted, updated, deleted} — the order every
+         * totals consumer assumes. Replays are idempotent: a re-seen CREATE
+         * hits NOT EXISTS, a re-seen UPDATE fails the changed predicate, a
+         * re-seen DELETE matches nothing. The UPDATE is neither built nor run
+         * for edge tables (no data columns — its SET clause would be empty).
          *
-         * <p>Non-tombstone rows with a NULL column are counted, warned about and
-         * skipped (the NOT NULL guards in the insert/update SQL): applying one
-         * would violate the target's NOT NULL constraints, abort the whole
-         * transaction with the cursor unmoved, and refail on the same page every
-         * cycle — a single poison entry must not freeze the stream.
+         * <p>Non-tombstone rows with a NULL column — absent OR unparseable,
+         * see {@link Col#castExpr()} — are warned about and skipped (the NOT
+         * NULL guards in the DML): applying one would abort the whole
+         * transaction with the cursor unmoved and refail on the same page
+         * every cycle — a single poison entry must not freeze the stream.
          */
         int[] applyChanges(Statement st) throws SQLException {
             st.execute(changeDedupeSql());
             int skipped = countUnappliable(st);
             if (skipped > 0) {
-                log.warn("change stream: {} {} event(s) skipped — payload missing a required"
-                    + " column (entry preserved in the audit log)", skipped, displayName());
+                log.warn("change stream: {} {} event(s) skipped — payload missing or"
+                    + " malformed for a required column (entry preserved in the audit"
+                    + " log)", skipped, displayName());
             }
-            return applyDml(st, changeDeleteSql(), changeUpdateSql(), changeInsertSql());
+            int deleted = st.executeUpdate(changeDeleteSql());
+            int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(changeUpdateSql());
+            int inserted = st.executeUpdate(changeInsertSql());
+            return new int[] {inserted, updated, deleted};
         }
 
         /** Staged non-tombstone rows with a NULL column: not insertable/updatable. */
@@ -252,59 +251,103 @@ public final class SccalReferenceSync {
             }
         }
 
-        /**
-         * Apply DELETE / UPDATE / INSERT; returns {inserted, updated, deleted} —
-         * the order every totals consumer assumes. UPDATE is skipped for edge
-         * tables (no data columns to change).
-         */
-        private int[] applyDml(Statement st, String delete, String update, String insert)
-                throws SQLException {
-            int deleted = st.executeUpdate(delete);
-            int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(update);
-            int inserted = st.executeUpdate(insert);
-            return new int[] {inserted, updated, deleted};
-        }
-
         private String displayName() {
             int dot = table.lastIndexOf('.');
             return (dot < 0 ? table : table.substring(dot + 1)).replace("\"", "");
         }
     }
 
-    // The reference tables and the object type each is captured from. The
-    // /changes stream only ever emits USER, WORKSPACE and GROUP entities, so
-    // those are the only object types captured; every other V6 table has no
-    // corresponding stream entity and is left empty.
-    //
-    // Each column coalesces the two payload conventions the stream mixes (see
-    // Col): the real Sentrinox shape ({userId, userName, isDeleted}) declared
-    // first, then the generic shape ({id, name, email}). Whichever the entry
-    // carries, the row is captured.
-    static final List<Sync> SYNCS = List.of(
-        new Sync("workspace", "ollylake.main.workspace",
-            List.of(new Col("workspace_id", List.of("workspaceId", "id"), "BIGINT")),
-            List.of(new Col("name", List.of("workspaceName", "name"), "VARCHAR"))),
-        new Sync("user", "ollylake.main.\"user\"",
-            List.of(new Col("user_id", List.of("userId", "id"), "BIGINT")),
-            List.of(new Col("name", List.of("userName", "email"), "VARCHAR"))),
-        new Sync("group", "ollylake.main.\"group\"",
-            List.of(new Col("group_id", List.of("groupId", "id"), "BIGINT")),
-            List.of(new Col("name", List.of("groupName", "name"), "VARCHAR")))
-    );
+    /** Bare SQL identifier — column names and JSON field names. */
+    private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+
+    /** Uppercase enum name, as the /changes stream emits entityTypes. */
+    private static final Pattern ENTITY_TYPE = Pattern.compile("[A-Z][A-Z0-9_]*");
+
+    /** Dot-qualified table name; a part may be double-quoted (reserved words). */
+    private static final Pattern TABLE_NAME = Pattern.compile(
+        "(?:[A-Za-z_][A-Za-z0-9_]*|\"[A-Za-z_][A-Za-z0-9_]*\")"
+            + "(?:\\.(?:[A-Za-z_][A-Za-z0-9_]*|\"[A-Za-z_][A-Za-z0-9_]*\"))*");
+
+    /** SQL type: VARCHAR, BIGINT, DECIMAL(10, 2), BIGINT[], TIMESTAMP WITH TIME ZONE, ... */
+    private static final Pattern SQL_TYPE = Pattern.compile(
+        "[A-Za-z][A-Za-z0-9_ ]*(?:\\(\\d+(?:, ?\\d+)?\\))?(?:\\[])?");
+
+    // The captured tables, declared in config (`analytics_cdc.syncs`) — the
+    // single source of truth; adding a table is a DDL migration + config block,
+    // no Java change. The config file documents the domain reasoning (emitted
+    // entityTypes, the RULE fan-out, the payload conventions). Must stay below
+    // the Pattern constants: static initializers run in declaration order and
+    // loadSyncs validates against them.
+    static final List<Sync> SYNCS = loadSyncs(ConfigFactory.load().getConfig("analytics_cdc"));
 
     /**
-     * SCCAL object type → the {@code /changes} entityType that feeds it (the
-     * stream emits enum names, the snapshot API used lowercase path segments).
-     * Every reference table is fed from the change stream, so every object type
-     * in {@link #SYNCS} appears here. The SINGLE source of truth for the
-     * type→entityType mapping — {@link ChangeStreamSync#SYNCS_BY_ENTITY_TYPE}
-     * derives from it. ACTIVATION entries also flow through the stream (audited)
-     * but feed no reference table, so they have no entry here.
+     * Build the {@link Sync} declarations from the config's {@code syncs}
+     * list, failing fast on a malformed entry — a bad declaration must abort
+     * startup, not silently drop a table from capture. Everything spliced into
+     * generated SQL is shape-validated; {@code entry_filter} is free-form SQL
+     * (trusted deploy-time input), guarded only against statement splicing.
      */
-    static final Map<String, String> STREAM_ENTITY_TYPES = Map.of(
-        "workspace", "WORKSPACE",
-        "user", "USER",
-        "group", "GROUP");
+    static List<Sync> loadSyncs(Config config) {
+        List<Sync> syncs = config.getConfigList("syncs").stream()
+            .map(SccalReferenceSync::parseSync)
+            .toList();
+        if (syncs.isEmpty()) {
+            throw new IllegalArgumentException(
+                "analytics_cdc.syncs is empty — no reference table would be captured");
+        }
+        if (syncs.stream().map(Sync::table).distinct().count() < syncs.size()) {
+            throw new IllegalArgumentException(
+                "analytics_cdc.syncs declares the same table more than once");
+        }
+        return syncs;
+    }
+
+    private static Sync parseSync(Config c) {
+        String table = c.getString("table");
+        try {
+            require(TABLE_NAME, table, "table");
+            String entityType = require(ENTITY_TYPE, c.getString("entity_type"), "entity_type");
+            List<Col> keyCols = parseCols(c.getConfigList("key_columns"));
+            if (keyCols.isEmpty()) {
+                throw new IllegalArgumentException("key_columns must not be empty");
+            }
+            List<Col> dataCols = c.hasPath("data_columns")
+                ? parseCols(c.getConfigList("data_columns"))
+                : List.of();
+            String filter = c.hasPath("entry_filter") ? c.getString("entry_filter") : null;
+            if (filter != null && (filter.isBlank() || filter.contains(";"))) {
+                throw new IllegalArgumentException(
+                    "entry_filter must be a single non-empty predicate (no ';')");
+            }
+            return new Sync(entityType, table, keyCols, dataCols, filter);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException(
+                "analytics_cdc.syncs entry for table '" + table + "': " + e.getMessage(), e);
+        }
+    }
+
+    private static List<Col> parseCols(List<? extends Config> colConfigs) {
+        return colConfigs.stream().map(c -> {
+            String column = require(IDENTIFIER, c.getString("column"), "column");
+            List<String> fields = c.getStringList("json_fields");
+            if (fields.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "json_fields must not be empty for column " + column);
+            }
+            fields.forEach(f -> require(IDENTIFIER, f, "json_fields entry"));
+            String type = require(SQL_TYPE, c.getString("type"), "type");
+            return new Col(column, List.copyOf(fields), type);
+        }).toList();
+    }
+
+    /** The value is spliced into generated SQL — reject anything outside its strict shape. */
+    private static String require(Pattern pattern, String value, String what) {
+        if (!pattern.matcher(value).matches()) {
+            throw new IllegalArgumentException(
+                what + " '" + value + "' must match " + pattern.pattern());
+        }
+        return value;
+    }
 
     public static void main(String[] args) throws Exception {
         Config config = ConfigFactory.load().getConfig("analytics_cdc");
@@ -316,33 +359,28 @@ public final class SccalReferenceSync {
         HttpClient http = SccalHttp.newClient();
 
         if (isOneShot(pollInterval)) {
-            // One-shot: bootstrap once (extensions + S3 secret + ATTACH) and run.
             try (Connection conn = SqlScripts.bootstrap(config);
                  Statement st = conn.createStatement()) {
                 runOnce(conn, st, http, baseUrl);
                 log.info("SCCAL reference sync complete.");
             }
         } else {
-            // Polling: poll() owns the connection so it can rebuild it after a
-            // failure that leaves it unusable (see the loop below).
             poll(config, http, baseUrl, pollInterval);
         }
     }
 
-    /** A zero or negative {@code poll_interval} means run once and exit (the default). */
+    /** A zero or negative {@code poll_interval} means run once and exit. */
     static boolean isOneShot(Duration pollInterval) {
         return pollInterval.isZero() || pollInterval.isNegative();
     }
 
     /**
      * Repeatedly capture on a fixed interval, surviving per-cycle failures.
-     *
-     * <p>Owns the DuckDB connection so it can rebuild it: a failed cycle can
-     * abort the DuckLake catalog transaction on the shared Postgres connection
-     * (which an in-place rollback cannot always clear) and can close the JDBC
-     * statement. Before each cycle the connection + statement are (re)bootstrapped
-     * if unusable — a fresh ATTACH gives a fresh catalog connection — so a single
-     * transient catalog error can no longer wedge the poller permanently.
+     * Owns the DuckDB connection so it can rebuild it: a failed cycle can
+     * abort the DuckLake catalog transaction in a way an in-place rollback
+     * cannot always clear, so an unusable connection is re-bootstrapped before
+     * the next cycle (a fresh ATTACH gives a fresh catalog connection) rather
+     * than wedging the poller permanently.
      */
     private static void poll(Config config, HttpClient http, String baseUrl,
                              Duration interval) throws InterruptedException {
@@ -390,7 +428,6 @@ public final class SccalReferenceSync {
             try {
                 conn.close();
             } catch (SQLException ignored) {
-                // Already closed or unusable — nothing more to do.
             }
         }
     }
@@ -405,9 +442,8 @@ public final class SccalReferenceSync {
             runOnce(conn, st, http, baseUrl);
         } catch (Exception e) {
             log.error("sync cycle failed — retrying next interval", e);
-            // The failure may have left the connection mid-transaction with
-            // autoCommit still false. Reset it so this stale state can't leak
-            // into the next cycle's writes.
+            // The failure may have left autoCommit off mid-transaction; reset
+            // so stale state can't leak into the next cycle's writes.
             resetConnection(conn);
         }
     }
@@ -417,22 +453,16 @@ public final class SccalReferenceSync {
         try {
             conn.rollback();
         } catch (SQLException ignored) {
-            // Connection was already in autoCommit mode (or unusable) — nothing to roll back.
+            // Already in autoCommit mode, or unusable — nothing to roll back.
         }
         try {
             conn.setAutoCommit(true);
         } catch (SQLException ignored) {
-            // Nothing more we can do here; the next cycle will surface a hard failure.
+            // The next cycle will surface a hard failure.
         }
     }
 
-    /**
-     * One full capture pass: drive the change stream — {@code /cursors}
-     * discovery (which also defines the capture scope) + per-tenant
-     * {@code /changes} deltas (usually a single cheap idle call), with a
-     * first-contact bootstrap that replays a newly seen pair's stream from the
-     * start. See {@link ChangeStreamSync}.
-     */
+    /** One full capture pass — see {@link ChangeStreamSync}. */
     static void runOnce(Connection conn, Statement st, HttpClient http,
                         String baseUrl) throws SQLException {
         ChangeStreamSync.run(conn, st, http, baseUrl);

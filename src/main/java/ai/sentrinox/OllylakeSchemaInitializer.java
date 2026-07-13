@@ -30,8 +30,6 @@ public final class OllylakeSchemaInitializer {
     public static void main(String[] args) throws Exception {
         Path initDir = Paths.get(env("INIT_DIR", "/init"));
 
-        // INSTALL/LOAD the DuckLake + S3 extensions, CREATE the MinIO secret and
-        // ATTACH the catalog — all from the shared startup script in the config.
         Config config = ConfigFactory.load().getConfig("analytics_cdc");
 
         try (Connection conn = SqlScripts.bootstrap(config);

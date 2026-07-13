@@ -17,7 +17,7 @@ class PollSelectionTest {
 
     @Test
     void nonPositiveIntervalIsOneShot() {
-        // Zero (the default) and any negative interval both mean run-once.
+        // Zero and any negative interval both mean run-once.
         assertTrue(SccalReferenceSync.isOneShot(Duration.ZERO));
         assertTrue(SccalReferenceSync.isOneShot(Duration.ofSeconds(-5)));
     }
@@ -30,7 +30,7 @@ class PollSelectionTest {
 
     @Test
     void defaultConfigValuePolls() {
-        // The shipped default (poll_interval = 1m) keeps the poll loop alive.
+        // The shipped default (poll_interval = 30s) keeps the poll loop alive.
         Duration shipped = ConfigFactory.load().getConfig("analytics_cdc").getDuration("poll_interval");
         assertFalse(SccalReferenceSync.isOneShot(shipped),
             "default poll_interval should keep polling");

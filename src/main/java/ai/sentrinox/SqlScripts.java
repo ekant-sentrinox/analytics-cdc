@@ -16,12 +16,9 @@ final class SqlScripts {
     /**
      * Open an in-memory DuckDB connection and run the config's startup script —
      * INSTALL/LOAD the DuckLake + S3 extensions, CREATE the MinIO secret and
-     * ATTACH the catalog. Both entry points ({@link OllylakeSchemaInitializer}
-     * and {@link SccalReferenceSync}) share this exact bootstrap.
-     *
-     * <p>The connection is returned open for the caller to use and close. If the
-     * startup script fails the connection is closed before the error propagates
-     * (a close failure is attached as suppressed), so it never leaks.
+     * ATTACH the catalog. Both entry points share this exact bootstrap. The
+     * connection is returned open for the caller to close; if the script fails
+     * it is closed before the error propagates, so it never leaks.
      */
     static Connection bootstrap(Config config) throws Exception {
         String startupScript = StartupScriptProvider.load(config).getStartupScript();
@@ -47,10 +44,9 @@ final class SqlScripts {
     }
 
     /**
-     * Run {@code body} in a transaction on {@code conn}: autoCommit off, commit
-     * or roll back per the body's return value, roll back on a throw, and always
-     * restore autoCommit. The one home for the scaffold the change-stream apply
-     * and bootstrap paths share.
+     * Run {@code body} in a transaction: autoCommit off, commit or roll back
+     * per the body's return value, roll back on a throw, always restore
+     * autoCommit.
      */
     static void inTransaction(Connection conn, TxnBody body) throws SQLException {
         conn.setAutoCommit(false);
@@ -79,14 +75,10 @@ final class SqlScripts {
     }
 
     /**
-     * Split a multi-statement SQL script into individual statements.
-     *
-     * <p>Splits on {@code ';'} but is aware of single-quoted string literals
-     * (with {@code ''} escaping), so a semicolon inside a quoted value — e.g. a
-     * MinIO password or S3 endpoint substituted into {@code CREATE SECRET} — is
-     * not mistaken for a statement terminator. Line comments ({@code -- ...} to
-     * end of line) are stripped, including comments trailing a statement on the
-     * same line, before splitting. Blank statements are dropped.
+     * Split a multi-statement SQL script on {@code ';'}, aware of
+     * single-quoted literals (with {@code ''} escaping) so a semicolon inside
+     * a quoted value — e.g. a MinIO password in {@code CREATE SECRET} — is not
+     * a terminator. Line comments are stripped first; blank statements dropped.
      */
     static List<String> splitStatements(String sql) {
         List<String> statements = new ArrayList<>();

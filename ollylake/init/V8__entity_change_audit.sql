@@ -4,7 +4,7 @@
 -- Every /changes entry the CDC job pulls is appended here verbatim (ALL entity
 -- types, including ones that feed no reference table, e.g. ACTIVATION) before
 -- being merged into the dimension tables — an immutable, queryable history of
--- "who changed what, when, in which activation commit".
+-- "who changed what, when, in which activation / transaction".
 --
 -- Payloads are stored as JSON text in VARCHAR columns (DuckLake/Parquet has no
 -- native JSON type); shred them at query time with DuckDB's json functions.
@@ -19,10 +19,12 @@ CREATE TABLE IF NOT EXISTS ollylake.main.entity_change_audit (
                                                                  customer_id   BIGINT  NOT NULL,
                                                                  tenant_id     BIGINT  NOT NULL,
                                                                  entity_type   VARCHAR NOT NULL,  -- USER, ACTIVATION, ...
-                                                                 entity_id     BIGINT,            -- id of the changed entity (ACTIVATION: the commit id)
+                                                                 entity_id     BIGINT,            -- id of the changed entity (ACTIVATION: the activation id)
                                                                  action        VARCHAR NOT NULL,  -- CREATE / UPDATE / DELETE / ACTIVATE
-                                                                 commit_id     BIGINT,            -- activation commit the change belongs to
+                                                                 activation_id BIGINT,            -- activation the change belongs to
+                                                                 txn_id        BIGINT,            -- transaction the change was written in
                                                                  changed_at    TIMESTAMPTZ,       -- audit time stamped by SCCAL
+                                                                 changed_by    BIGINT,            -- user id who made the change (stamped by SCCAL)
                                                                  sccal_payload VARCHAR,           -- minimal CDC shape (JSON text)
                                                                  human_payload VARCHAR            -- full response DTO (JSON text; secret-free upstream)
 );

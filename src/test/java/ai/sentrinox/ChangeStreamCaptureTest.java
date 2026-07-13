@@ -4,15 +4,14 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.net.URI;
 import java.net.http.HttpClient;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.ArrayDeque;
-import java.util.Deque;
 
+import static ai.sentrinox.TestSupport.changesPage;
+import static ai.sentrinox.TestSupport.cursorsPage;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,11 +33,7 @@ class ChangeStreamCaptureTest {
     private Connection conn;
     private Statement st;
     private HttpClient http;
-
-    /** Body the /cursors stub returns (any startOffset). */
-    private String cursorsJson = "{}";
-    /** FIFO of /changes responses: String body (HTTP 200) or Integer status. */
-    private final Deque<Object> changesResponses = new ArrayDeque<>();
+    private final TestSupport.SccalStub stub = new TestSupport.SccalStub();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -48,7 +43,7 @@ class ChangeStreamCaptureTest {
         TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
         TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
 
-        http = stubClient();
+        http = stub.client();
     }
 
     @AfterEach
@@ -61,8 +56,8 @@ class ChangeStreamCaptureTest {
 
     @Test
     void bootstrapReplaysStreamAndSeedsCursors() throws SQLException {
-        cursorsJson = cursorsPage(entry(5, 42), 6);
-        changesResponses.add(changesPage(43, false,
+        stub.cursorsJson = cursorsPage(entry(5, 42), 6);
+        stub.changesResponses.add(changesPage(43, false,
             userChange(41, "CREATE", 10, "a@x.com", false),
             userChange(42, "CREATE", 20, "b@x.com", false)));
 
@@ -79,7 +74,7 @@ class ChangeStreamCaptureTest {
         // The registry lists no pairs yet: nothing is known, so nothing is
         // captured and no cursor state is written. First contact with a pair
         // happens when it first appears in the registry.
-        cursorsJson = "{\"entries\":[],\"nextOffset\":1,\"hasMore\":false}";
+        stub.cursorsJson = "{\"entries\":[],\"nextOffset\":1,\"hasMore\":false}";
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
@@ -96,7 +91,7 @@ class ChangeStreamCaptureTest {
 
         // The registry reports no advance: the stream-fed tables must not be
         // touched and the cursor must stay put.
-        cursorsJson = "{\"entries\":[],\"nextOffset\":6,\"hasMore\":false}";
+        stub.cursorsJson = "{\"entries\":[],\"nextOffset\":6,\"hasMore\":false}";
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(2, count(USER_TABLE));
@@ -108,8 +103,8 @@ class ChangeStreamCaptureTest {
     void streamAppliesCreateUpdateDeleteAndIgnoresActivation() throws SQLException {
         bootstrap();
 
-        cursorsJson = cursorsPage(entry(7, 46), 8);
-        changesResponses.add(changesPage(47, false,
+        stub.cursorsJson = cursorsPage(entry(7, 46), 8);
+        stub.changesResponses.add(changesPage(47, false,
             userChange(43, "CREATE", 30, "c@x.com", false),
             userChange(44, "UPDATE", 20, "renamed@x.com", false),
             userChange(45, "DELETE", 10, "a@x.com", true),
@@ -128,15 +123,17 @@ class ChangeStreamCaptureTest {
         // that feeds no reference table — with both payload views.
         assertEquals(4, count(AUDIT_TABLE));
         try (ResultSet rs = st.executeQuery(
-            "SELECT entity_type, action, commit_id,"
+            "SELECT entity_type, action, activation_id, txn_id, changed_by,"
                 + " sccal_payload::JSON->>'userName', human_payload::JSON->>'email'"
                 + " FROM " + AUDIT_TABLE + " WHERE change_id = 44")) {
             assertTrue(rs.next());
             assertEquals("USER", rs.getString(1));
             assertEquals("UPDATE", rs.getString(2));
             assertEquals(77, rs.getLong(3));
-            assertEquals("renamed@x.com", rs.getString(4));
-            assertEquals("renamed@x.com", rs.getString(5));
+            assertEquals(88, rs.getLong(4));
+            assertEquals(99, rs.getLong(5));
+            assertEquals("renamed@x.com", rs.getString(6));
+            assertEquals("renamed@x.com", rs.getString(7));
         }
         try (ResultSet rs = st.executeQuery(
             "SELECT action FROM " + AUDIT_TABLE + " WHERE change_id = 46")) {
@@ -149,10 +146,10 @@ class ChangeStreamCaptureTest {
     void streamPagesUntilHasMoreIsFalse() throws SQLException {
         bootstrap();
 
-        cursorsJson = cursorsPage(entry(7, 44), 8);
-        changesResponses.add(changesPage(44, true,
+        stub.cursorsJson = cursorsPage(entry(7, 44), 8);
+        stub.changesResponses.add(changesPage(44, true,
             userChange(43, "CREATE", 30, "first@x.com", false)));
-        changesResponses.add(changesPage(45, false,
+        stub.changesResponses.add(changesPage(45, false,
             userChange(44, "UPDATE", 30, "second@x.com", false)));
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
@@ -167,8 +164,8 @@ class ChangeStreamCaptureTest {
 
         // A deactivation modelled as an UPDATE whose payload says isDeleted:true
         // must remove the row.
-        cursorsJson = cursorsPage(entry(7, 43), 8);
-        changesResponses.add(changesPage(44, false,
+        stub.cursorsJson = cursorsPage(entry(7, 43), 8);
+        stub.changesResponses.add(changesPage(44, false,
             userChange(43, "UPDATE", 20, "b@x.com", true)));
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
@@ -182,8 +179,8 @@ class ChangeStreamCaptureTest {
     void createThenDeleteInOnePageNetsToNoRow() throws SQLException {
         bootstrap();
 
-        cursorsJson = cursorsPage(entry(7, 44), 8);
-        changesResponses.add(changesPage(45, false,
+        stub.cursorsJson = cursorsPage(entry(7, 44), 8);
+        stub.changesResponses.add(changesPage(45, false,
             userChange(43, "CREATE", 30, "ghost@x.com", false),
             userChange(44, "DELETE", 30, "ghost@x.com", true)));
 
@@ -200,8 +197,8 @@ class ChangeStreamCaptureTest {
         String page = changesPage(44, false,
             userChange(43, "CREATE", 30, "c@x.com", false));
 
-        cursorsJson = cursorsPage(entry(7, 43), 8);
-        changesResponses.add(page);
+        stub.cursorsJson = cursorsPage(entry(7, 43), 8);
+        stub.changesResponses.add(page);
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         // Same registry row again (e.g. crash before this consumer's state was
@@ -209,7 +206,7 @@ class ChangeStreamCaptureTest {
         st.execute("DELETE FROM ollylake.main.sccal_change_cursor");
         st.execute("INSERT INTO ollylake.main.sccal_change_cursor VALUES (" + CUST + ", " + TEN + ", 43)");
         st.execute("DELETE FROM ollylake.main.sccal_registry_cursor");
-        changesResponses.add(page);
+        stub.changesResponses.add(page);
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(3, count(USER_TABLE));
@@ -228,8 +225,8 @@ class ChangeStreamCaptureTest {
         // pruned: /changes answers 410. With no snapshot fallback the pruned
         // changes are lost; the cursor fast-forwards to the registry head so the
         // stream keeps flowing.
-        cursorsJson = cursorsPage(entry(9, 100), 10);
-        changesResponses.add(410);
+        stub.cursorsJson = cursorsPage(entry(9, 100), 10);
+        stub.changesResponses.add(410);
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
@@ -244,11 +241,11 @@ class ChangeStreamCaptureTest {
     void goneFastForwardsOnlyTheAffectedPair() throws SQLException {
         // Two pairs in the registry; both bootstrap in one run by replaying
         // their streams from the start.
-        cursorsJson = cursorsPage(
+        stub.cursorsJson = cursorsPage(
             entry(5, CUST, TEN, 42) + "," + entry(6, 3, 4, 50), 7);
-        changesResponses.add(changesPage(43, false,
+        stub.changesResponses.add(changesPage(43, false,
             userChange(41, "CREATE", 10, "a@x.com", false)));   // (CUST, TEN)
-        changesResponses.add(changesPage(51, false,
+        stub.changesResponses.add(changesPage(51, false,
             userChange(50, "CREATE", 99, "z@x.com", false)));   // (3, 4)
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
         assertEquals(43, changeOffsetFor(CUST, TEN));
@@ -256,8 +253,8 @@ class ChangeStreamCaptureTest {
 
         // (CUST, TEN) advances but its saved offset was pruned: only that pair's
         // cursor fast-forwards — the healthy pair keeps its cursor.
-        cursorsJson = cursorsPage(entry(8, CUST, TEN, 60), 9);
-        changesResponses.add(410);
+        stub.cursorsJson = cursorsPage(entry(8, CUST, TEN, 60), 9);
+        stub.changesResponses.add(410);
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(61, changeOffsetFor(CUST, TEN));  // fast-forwarded to 60 + 1
@@ -272,10 +269,10 @@ class ChangeStreamCaptureTest {
         // Page 1 (offset 43) succeeds and is applied + audited; page 2 answers
         // 410. The pre-410 page must survive — cursor advanced past it and
         // committed, audit rows kept — with the fast-forward covering the rest.
-        cursorsJson = cursorsPage(entry(7, 46), 8);
-        changesResponses.add(changesPage(44, true,
+        stub.cursorsJson = cursorsPage(entry(7, 46), 8);
+        stub.changesResponses.add(changesPage(44, true,
             userChange(43, "CREATE", 30, "c@x.com", false)));
-        changesResponses.add(410);
+        stub.changesResponses.add(410);
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
@@ -300,7 +297,7 @@ class ChangeStreamCaptureTest {
             }
             entries.append(entry(100 + i, 40));
         }
-        cursorsJson = "{\"entries\":[" + entries + "],\"startOffset\":1,\"limit\":1000,"
+        stub.cursorsJson = "{\"entries\":[" + entries + "],\"startOffset\":1,\"limit\":1000,"
             + "\"nextOffset\":1100,\"hasMore\":false}";
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
@@ -318,10 +315,10 @@ class ChangeStreamCaptureTest {
         // abort the transaction and refail on the same page every cycle. It must
         // be skipped — kept in the audit log — with the rest of the page applied
         // and the cursor advanced past it.
-        cursorsJson = cursorsPage(entry(7, 44), 8);
-        changesResponses.add(changesPage(45, false,
+        stub.cursorsJson = cursorsPage(entry(7, 44), 8);
+        stub.changesResponses.add(changesPage(45, false,
             "{\"id\":\"43\",\"entityType\":\"USER\",\"action\":\"CREATE\",\"entityId\":\"30\","
-                + "\"commitId\":\"77\",\"changedAt\":\"2026-07-01T00:00:00Z\","
+                + "\"activationId\":\"77\",\"txnId\":\"88\",\"changedAt\":\"2026-07-01T00:00:00Z\","
                 + "\"sccal\":{\"userId\":\"30\"},\"human\":{}}",
             userChange(44, "UPDATE", 20, "renamed@x.com", false)));
 
@@ -329,6 +326,28 @@ class ChangeStreamCaptureTest {
 
         assertEquals(2, count(USER_TABLE));              // poison row not inserted
         assertTrue(!userExists(30));
+        assertEquals("renamed@x.com", userName(20));     // rest of the page applied
+        assertEquals(45, changeOffset());                // cursor moved past the poison
+        assertEquals(2, count(AUDIT_TABLE));             // both audited
+    }
+
+    @Test
+    void malformedValuePoisonEntryIsSkippedNotWedged() throws SQLException {
+        bootstrap();
+
+        // Entry 43's userId is present but non-numeric: TRY_CAST turns it into
+        // a NULL key that the NOT NULL guards skip. A hard cast would abort
+        // the transaction with the cursor unmoved and refail on the same page
+        // every cycle.
+        stub.cursorsJson = cursorsPage(entry(7, 44), 8);
+        stub.changesResponses.add(changesPage(45, false,
+            TestSupport.changeEntry(43, "USER", "CREATE", 30,
+                "{\"userId\":\"not-a-number\",\"userName\":\"x@x.com\"}", "{}"),
+            userChange(44, "UPDATE", 20, "renamed@x.com", false)));
+
+        SccalReferenceSync.runOnce(conn, st, http, "http://stub");
+
+        assertEquals(2, count(USER_TABLE));              // poison row not inserted
         assertEquals("renamed@x.com", userName(20));     // rest of the page applied
         assertEquals(45, changeOffset());                // cursor moved past the poison
         assertEquals(2, count(AUDIT_TABLE));             // both audited
@@ -342,8 +361,8 @@ class ChangeStreamCaptureTest {
 
         // A never-seen pair appears in the registry: it has no saved cursor, so
         // its stream replays from the start; the healthy pair's cursor stays put.
-        cursorsJson = cursorsPage(entry(7, 3, 4, 50), 8);
-        changesResponses.add(changesPage(51, false,
+        stub.cursorsJson = cursorsPage(entry(7, 3, 4, 50), 8);
+        stub.changesResponses.add(changesPage(51, false,
             userChange(50, "CREATE", 99, "z@x.com", false)));
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
@@ -361,7 +380,7 @@ class ChangeStreamCaptureTest {
         // The registry reports an advance our cursor already covers: nothing to
         // pull, so the cycle must roll back rather than write a metadata-only
         // DuckLake snapshot.
-        cursorsJson = cursorsPage(entry(7, 40), 8);
+        stub.cursorsJson = cursorsPage(entry(7, 40), 8);
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
         assertEquals(43, changeOffset());
@@ -376,13 +395,16 @@ class ChangeStreamCaptureTest {
         // stream fails on its INSERT. With no snapshot phase the failure
         // propagates and the whole stream transaction rolls back.
         st.execute("DROP TABLE " + AUDIT_TABLE);
-        cursorsJson = cursorsPage(entry(7, 46), 8);
-        changesResponses.add(changesPage(47, false,
+        stub.cursorsJson = cursorsPage(entry(7, 46), 8);
+        stub.changesResponses.add(changesPage(47, false,
             userChange(43, "CREATE", 30, "c@x.com", false)));
 
         assertThrows(SQLException.class,
             () -> SccalReferenceSync.runOnce(conn, st, http, "http://stub"));
 
+        // DuckDB's JDBC driver closes a Statement whose execute threw; the poll
+        // loop re-bootstraps in that case (usable() check) — mirror it here.
+        st = conn.createStatement();
         assertEquals(43, changeOffset());                   // stream txn rolled back
         assertEquals(2, count(USER_TABLE));                 // stream data rolled back too
     }
@@ -396,8 +418,8 @@ class ChangeStreamCaptureTest {
      * counts only its own audit rows.
      */
     private void bootstrap() throws SQLException {
-        cursorsJson = cursorsPage(entry(5, 42), 6);
-        changesResponses.add(changesPage(43, false,
+        stub.cursorsJson = cursorsPage(entry(5, 42), 6);
+        stub.changesResponses.add(changesPage(43, false,
             userChange(41, "CREATE", 10, "a@x.com", false),
             userChange(42, "CREATE", 20, "b@x.com", false)));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
@@ -410,47 +432,16 @@ class ChangeStreamCaptureTest {
     }
 
     private static String entry(long seq, long customerId, long tenantId, long lastChangeId) {
-        return "{\"seq\":\"" + seq + "\",\"customerId\":\"" + customerId + "\",\"tenantId\":\""
-            + tenantId + "\",\"lastChangeId\":\"" + lastChangeId + "\",\"lastActivationId\":\"9\","
-            + "\"updatedAt\":\"2026-07-01T00:00:00Z\"}";
-    }
-
-    private static String cursorsPage(String entry, long nextOffset) {
-        return "{\"entries\":[" + entry + "],\"startOffset\":1,\"limit\":1000,\"nextOffset\":"
-            + nextOffset + ",\"hasMore\":false}";
-    }
-
-    private static String changesPage(long nextOffset, boolean hasMore, String... entries) {
-        return "{\"entries\":[" + String.join(",", entries) + "],\"startOffset\":1,\"limit\":1000,"
-            + "\"nextOffset\":" + nextOffset + ",\"hasMore\":" + hasMore + "}";
+        return TestSupport.cursorEntry(seq, customerId, tenantId, lastChangeId);
     }
 
     private static String userChange(long id, String action, long userId, String userName,
                                      boolean isDeleted) {
-        return "{\"id\":\"" + id + "\",\"entityType\":\"USER\",\"action\":\"" + action
-            + "\",\"entityId\":\"" + userId + "\",\"commitId\":\"77\","
-            + "\"changedAt\":\"2026-07-01T00:00:00Z\","
-            + "\"sccal\":{\"userId\":\"" + userId + "\",\"userName\":\"" + userName
-            + "\",\"isDeleted\":" + isDeleted + "},"
-            + "\"human\":{\"userId\":\"" + userId + "\",\"email\":\"" + userName
-            + "\",\"status\":\"ACTIVE\"}}";
-    }
-
-    private HttpClient stubClient() {
-        return TestSupport.httpStub(req -> {
-            URI uri = req.uri();
-            String path = uri.getPath();
-            if (path.endsWith("/cursors")) {
-                return TestSupport.response(200, cursorsJson, uri);
-            }
-            if (path.endsWith("/changes")) {
-                Object next = changesResponses.isEmpty() ? "{}" : changesResponses.poll();
-                return next instanceof Integer status
-                    ? TestSupport.response(status, "", uri)
-                    : TestSupport.response(200, (String) next, uri);
-            }
-            throw new AssertionError("unexpected endpoint (only /cursors and /changes exist): " + path);
-        });
+        return TestSupport.changeEntry(id, "USER", action, userId,
+            "{\"userId\":\"" + userId + "\",\"userName\":\"" + userName
+                + "\",\"isDeleted\":" + isDeleted + "}",
+            "{\"userId\":\"" + userId + "\",\"email\":\"" + userName
+                + "\",\"status\":\"ACTIVE\"}");
     }
 
     private long count(String table) throws SQLException {
