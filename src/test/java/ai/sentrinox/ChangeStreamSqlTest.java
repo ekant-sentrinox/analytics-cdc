@@ -62,12 +62,14 @@ class ChangeStreamSqlTest {
     }
 
     @Test
-    void deleteOnlyAppliesTombstones() {
+    void deleteSoftDeletesTombstones() {
+        // A tombstone flips is_deleted on the live row (keeping it) rather than
+        // removing it; the guard makes a replayed tombstone a no-op.
         assertEquals(
-            "DELETE FROM ollylake.main.\"user\" t WHERE EXISTS "
-                + "(SELECT 1 FROM cdc_chg_ollylake_main__user_ s "
+            "UPDATE ollylake.main.\"user\" t SET is_deleted = true "
+                + "FROM cdc_chg_ollylake_main__user_ s "
                 + "WHERE t.customer_id = s.customer_id AND t.user_id = s.user_id"
-                + " AND s.__action = 'DELETE')",
+                + " AND s.__action = 'DELETE' AND t.is_deleted = false",
             sync("ollylake.main.\"user\"").changeDeleteSql());
     }
 
@@ -80,6 +82,9 @@ class ChangeStreamSqlTest {
         String update = sync("ollylake.main.\"user\"").changeUpdateSql();
         assertTrue(update.contains("s.__action <> 'DELETE'"), update);
         assertTrue(update.contains("t.name IS DISTINCT FROM s.name"), update);
+        // The update also un-deletes (revives) a previously soft-deleted row.
+        assertTrue(update.contains("is_deleted = false"), update);
+        assertTrue(update.contains("t.is_deleted"), update);
     }
 
     @Test
