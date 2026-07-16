@@ -96,6 +96,9 @@ services:
     volumes:
       - ./ollylake/init:/init:ro            # SQL files, editable without rebuild
       - ./ollylake/startup.sql:/config/startup.sql:ro
+      # Persist DuckDB's downloaded extensions (ducklake/httpfs/postgres) so they
+      # are fetched from extensions.duckdb.org only once, not on every recreate.
+      - duckdb-ext:/root/.duckdb
 
   # ---------------------------------------------------------------------------
   # analytics-cdc — Java program (ai.sentrinox.SccalReferenceSync) that discovers
@@ -135,7 +138,10 @@ services:
     entrypoint: ["java", "-cp", "/app/app.jar", "ai.sentrinox.SccalReferenceSync"]
     volumes:
       - ./ollylake/startup.sql:/config/startup.sql:ro
+      # Share the same DuckDB extension cache as ollylake-init.
+      - duckdb-ext:/root/.duckdb
 
 volumes:
   minio-data:
   metadata-db-data:
+  duckdb-ext:
