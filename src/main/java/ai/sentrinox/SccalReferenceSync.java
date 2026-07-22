@@ -127,18 +127,39 @@ public final class SccalReferenceSync {
             return join(allCols(), c -> c.column() + " " + c.sqlType(), ", ");
         }
 
-        /** {@code d1 = s.d1, d2 = s.d2} SET clause over the data columns. */
+        /**
+         * {@code d1 = s.d1, ..., is_deleted = false} SET clause: the data
+         * columns plus the un-delete flag, so re-seeing an entity revives a
+         * row a prior tombstone soft-deleted. Valid even for an edge table (no
+         * data columns) — it degrades to just {@code is_deleted = false}.
+         */
         private String setClause() {
-            return join(dataCols, c -> c.column() + " = s." + c.column(), ", ");
+            String unDelete = "is_deleted = false";
+            if (dataCols.isEmpty()) {
+                return unDelete;
+            }
+            return join(dataCols, c -> c.column() + " = s." + c.column(), ", ") + ", " + unDelete;
         }
 
+        /**
+         * A staged non-tombstone row differs from what is stored: some data
+         * column changed, or the stored row is soft-deleted and must be revived
+         * ({@code is_deleted} flipped back to false).
+         */
         private String changedPredicate() {
-            return join(dataCols, c -> "t." + c.column() + " IS DISTINCT FROM s." + c.column(), " OR ");
+            String revive = "t.is_deleted";
+            if (dataCols.isEmpty()) {
+                return revive;
+            }
+            return join(dataCols, c -> "t." + c.column() + " IS DISTINCT FROM s." + c.column(), " OR ")
+                + " OR " + revive;
         }
 
         // ---- change-stream staging + merge -----------------------------------
         // Fed from a /changes page (entity-change stream). Deletes are explicit
-        // tombstones (action = 'DELETE'), never inferred from absence.
+        // tombstones (action = 'DELETE'), never inferred from absence, and are
+        // applied as a soft-delete: the row is kept with is_deleted = true so
+        // audit-log joins still resolve a deleted entity's name.
 
         /** Temp staging table for /changes entries, unique per target table. */
         String changeStage() {
@@ -191,14 +212,29 @@ public final class SccalReferenceSync {
                 + " ORDER BY __change_id DESC) = 1";
         }
 
+        /**
+         * Soft-delete: flip {@code is_deleted} on the live rows a tombstone
+         * targets and keep them, so audit-log joins still resolve a deleted
+         * entity's name. The {@code t.is_deleted = false} guard makes a
+         * replayed tombstone a no-op and counts only real live→deleted
+         * transitions. A tombstone for a key not present is dropped — there is
+         * nothing to flag (the entity was never captured live).
+         */
         String changeDeleteSql() {
-            return "DELETE FROM " + table + " t WHERE EXISTS (SELECT 1 FROM " + changeStage()
-                + " s WHERE " + keyEq() + " AND s.__action = 'DELETE')";
+            return "UPDATE " + table + " t SET is_deleted = true FROM " + changeStage()
+                + " s WHERE " + keyEq() + " AND s.__action = 'DELETE' AND t.is_deleted = false";
         }
 
+        /**
+         * Update the live attributes of matched rows and, when a tombstone had
+         * soft-deleted the row, revive it ({@code is_deleted = false}). Always
+         * valid: the {@code notNull} guard is dropped for an edge table (no
+         * data columns), leaving a pure revive.
+         */
         String changeUpdateSql() {
+            String notNullGuard = dataCols.isEmpty() ? "" : " AND " + notNull(dataCols);
             return "UPDATE " + table + " t SET " + setClause() + " FROM " + changeStage() + " s WHERE "
-                + keyEq() + " AND s.__action <> 'DELETE' AND " + notNull(dataCols)
+                + keyEq() + " AND s.__action <> 'DELETE'" + notNullGuard
                 + " AND (" + changedPredicate() + ")";
         }
 
@@ -215,12 +251,14 @@ public final class SccalReferenceSync {
         }
 
         /**
-         * Apply one staged /changes page (dedupe, then DELETE / UPDATE /
+         * Apply one staged /changes page (dedupe, then soft-DELETE / UPDATE /
          * INSERT); returns {inserted, updated, deleted} — the order every
-         * totals consumer assumes. Replays are idempotent: a re-seen CREATE
-         * hits NOT EXISTS, a re-seen UPDATE fails the changed predicate, a
-         * re-seen DELETE matches nothing. The UPDATE is neither built nor run
-         * for edge tables (no data columns — its SET clause would be empty).
+         * totals consumer assumes, where "deleted" counts rows flagged
+         * {@code is_deleted}. Replays are idempotent: a re-seen CREATE hits NOT
+         * EXISTS, a re-seen UPDATE fails the changed predicate, a re-seen
+         * tombstone fails the {@code is_deleted = false} guard. The UPDATE
+         * always runs — even for an edge table it maintains {@code is_deleted}
+         * (revives a previously soft-deleted row).
          *
          * <p>Non-tombstone rows with a NULL column — absent OR unparseable,
          * see {@link Col#castExpr()} — are warned about and skipped (the NOT
@@ -237,7 +275,7 @@ public final class SccalReferenceSync {
                     + " log)", skipped, displayName());
             }
             int deleted = st.executeUpdate(changeDeleteSql());
-            int updated = dataCols.isEmpty() ? 0 : st.executeUpdate(changeUpdateSql());
+            int updated = st.executeUpdate(changeUpdateSql());
             int inserted = st.executeUpdate(changeInsertSql());
             return new int[] {inserted, updated, deleted};
         }

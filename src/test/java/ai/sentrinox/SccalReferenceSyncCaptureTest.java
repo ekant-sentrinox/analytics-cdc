@@ -12,7 +12,6 @@ import java.sql.Statement;
 import static ai.sentrinox.TestSupport.changesPage;
 import static ai.sentrinox.TestSupport.cursorsPage;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -96,16 +95,17 @@ class SccalReferenceSyncCaptureTest {
         bootstrap();   // seeds users 10, 20, 30
 
         // A generic-shape entry whose payload says op:"delete" (no isDeleted) is
-        // a tombstone even when the action is not DELETE.
+        // a tombstone even when the action is not DELETE: the row is kept and
+        // flagged is_deleted.
         stub.cursorsJson = cursorsPage(entry(2, 14), 3);
         stub.changesResponses.add(changesPage(15, false,
             change(14, "USER", "UPDATE", 30,
                 "{\"id\":\"30\",\"op\":\"delete\",\"type\":\"user\"}")));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(2, count("ollylake.main.\"user\""));
-        assertFalse(TestSupport.exists(st,
-            "SELECT 1 FROM ollylake.main.\"user\" WHERE user_id = 30"));
+        assertEquals(3, count("ollylake.main.\"user\""));
+        assertTrue(TestSupport.exists(st,
+            "SELECT 1 FROM ollylake.main.\"user\" WHERE user_id = 30 AND is_deleted"));
     }
 
     @Test
@@ -144,7 +144,10 @@ class SccalReferenceSyncCaptureTest {
             change(14, "WORKSPACE", "DELETE", 2, "{\"workspaceId\":\"2\"}")));
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(1, count("ollylake.main.workspace"));
+        // Soft-delete: the row is kept and flagged, not removed.
+        assertEquals(2, count("ollylake.main.workspace"));
+        assertTrue(TestSupport.exists(st,
+            "SELECT 1 FROM ollylake.main.workspace WHERE workspace_id = 2 AND is_deleted"));
     }
 
     @Test

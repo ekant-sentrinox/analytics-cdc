@@ -113,8 +113,9 @@ class ChangeStreamCaptureTest {
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(2, count(USER_TABLE));      // +30, -10
+        assertEquals(3, count(USER_TABLE));      // +30, 10 soft-deleted (kept)
         assertTrue(userExists(30));
+        assertTrue(userIsDeleted(10));           // tombstone flags the row, keeps it
         assertEquals("renamed@x.com", userName(20));
         assertEquals(47, changeOffset());        // the page's nextOffset
         assertEquals(8, registryOffset());
@@ -159,19 +160,21 @@ class ChangeStreamCaptureTest {
     }
 
     @Test
-    void softDeleteViaUpdateActionRemovesTheRow() throws SQLException {
+    void softDeleteViaUpdateActionFlagsTheRow() throws SQLException {
         bootstrap();
 
         // A deactivation modelled as an UPDATE whose payload says isDeleted:true
-        // must remove the row.
+        // soft-deletes the row: it is kept with is_deleted = true so its name
+        // still resolves for historical audit joins.
         stub.cursorsJson = cursorsPage(entry(7, 43), 8);
         stub.changesResponses.add(changesPage(44, false,
             userChange(43, "UPDATE", 20, "b@x.com", true)));
 
         SccalReferenceSync.runOnce(conn, st, http, "http://stub");
 
-        assertEquals(1, count(USER_TABLE));
-        assertTrue(!userExists(20));
+        assertEquals(2, count(USER_TABLE));
+        assertTrue(userExists(20));
+        assertTrue(userIsDeleted(20));
         assertEquals(44, changeOffset());
     }
 
@@ -450,6 +453,11 @@ class ChangeStreamCaptureTest {
 
     private boolean userExists(long userId) throws SQLException {
         return TestSupport.exists(st, "SELECT 1 FROM " + USER_TABLE + " WHERE user_id = " + userId);
+    }
+
+    private boolean userIsDeleted(long userId) throws SQLException {
+        return TestSupport.exists(st,
+            "SELECT 1 FROM " + USER_TABLE + " WHERE user_id = " + userId + " AND is_deleted");
     }
 
     private String userName(long userId) throws SQLException {
