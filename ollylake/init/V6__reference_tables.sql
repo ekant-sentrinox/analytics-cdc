@@ -50,20 +50,53 @@ CREATE TABLE IF NOT EXISTS ollylake.main.vkey (
 );
 ALTER TABLE ollylake.main.vkey SET PARTITIONED BY (customer_id);
 
--- Global lookup — every customer may read it. No customer_id, not partitioned.
--- provider_id is INTEGER in ai_txn — keep consistent.
+-- Global lookups — every customer may read them. No customer_id, not
+-- partitioned. Fed from the catalogue /list pull (snapshot + updatedSince
+-- deltas — the global catalog tier is not in the /changes stream; see the
+-- admin layer's global-catalog-sync.md). Ids are the source cluster's
+-- Snowflake ids copied verbatim so they join to fact data — hence BIGINT
+-- (ai_txn's INTEGER provider_id still joins via implicit widening).
 CREATE TABLE IF NOT EXISTS ollylake.main.provider (
-                                                      provider_id     INTEGER NOT NULL,
+                                                      provider_id     BIGINT  NOT NULL,
                                                       name            VARCHAR NOT NULL,
                                                       is_deleted      BOOLEAN NOT NULL DEFAULT 0
 );
 
--- Global lookup — every customer may read it. No customer_id, not partitioned.
+-- Global lookup fed from the catalogue pull, like provider. provider_id links
+-- a model to its provider (a join key, kept alongside the name).
+CREATE TABLE IF NOT EXISTS ollylake.main.model (
+                                                   model_id        BIGINT  NOT NULL,
+                                                   name            VARCHAR NOT NULL,
+                                                   provider_id     BIGINT  NOT NULL,
+                                                   is_deleted      BOOLEAN NOT NULL DEFAULT 0
+);
+
+-- Global lookup fed from the catalogue pull, like provider.
 CREATE TABLE IF NOT EXISTS ollylake.main.mcp_server (
                                                         mcp_server_id   BIGINT  NOT NULL,
                                                         name            VARCHAR NOT NULL,
                                                         is_deleted      BOOLEAN NOT NULL DEFAULT 0
 );
+
+-- Global lookup fed from the catalogue pull. mcp_server_id links a tool to
+-- its server (a join key, kept alongside the name).
+CREATE TABLE IF NOT EXISTS ollylake.main.mcp_tool (
+                                                      mcp_tool_id     BIGINT  NOT NULL,
+                                                      name            VARCHAR NOT NULL,
+                                                      mcp_server_id   BIGINT  NOT NULL,
+                                                      is_deleted      BOOLEAN NOT NULL DEFAULT 0
+);
+
+-- Per-customer, fed from the catalogue pull's per-pair tenant/list snapshot
+-- (the /changes stream carries no TENANT entity). Never tombstoned — the
+-- endpoint always answers isDeleted:false.
+CREATE TABLE IF NOT EXISTS ollylake.main.tenant (
+                                                    tenant_id   BIGINT  NOT NULL,
+                                                    customer_id BIGINT  NOT NULL,
+                                                    name        VARCHAR NOT NULL,
+                                                    is_deleted  BOOLEAN NOT NULL DEFAULT 0
+);
+ALTER TABLE ollylake.main.tenant SET PARTITIONED BY (customer_id);
 
 CREATE TABLE IF NOT EXISTS ollylake.main.mcp_access_rule (
                                                              mcp_access_rule_id  BIGINT  NOT NULL,

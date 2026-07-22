@@ -54,7 +54,7 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      BUCKET: ${OLLYLAKE_BUCKET:-ollylake}
+      BUCKET: ${OLLYLAKE_BUCKET:-ollylake-cdc}
     entrypoint:
       - /bin/sh
       - -c
@@ -86,7 +86,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
-      OLLYLAKE_BUCKET: ${OLLYLAKE_BUCKET:-ollylake}
+      OLLYLAKE_BUCKET: ${OLLYLAKE_BUCKET:-ollylake-cdc}
       METADATA_DB_HOST: ${METADATA_DB_HOST:-metadata-db}
       METADATA_DB_PORT: ${METADATA_DB_PORT:-5432}
       METADATA_DB_NAME: ${METADATA_DB_NAME:-ollylake_catalog}
@@ -124,7 +124,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_ENDPOINT: ${S3_ENDPOINT:-minio:9000}
-      OLLYLAKE_BUCKET: ${OLLYLAKE_BUCKET:-ollylake}
+      OLLYLAKE_BUCKET: ${OLLYLAKE_BUCKET:-ollylake-cdc}
       METADATA_DB_HOST: ${METADATA_DB_HOST:-metadata-db}
       METADATA_DB_PORT: ${METADATA_DB_PORT:-5432}
       METADATA_DB_NAME: ${METADATA_DB_NAME:-ollylake_catalog}
