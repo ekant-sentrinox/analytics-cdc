@@ -20,8 +20,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * End-to-end tests for the change-stream capture path ({@link ChangeStreamSync})
  * against a real in-memory DuckDB, with the two SCCAL endpoints stubbed:
  * {@code /cursors} answers from configurable state; {@code /changes} answers
- * from a FIFO queue (so multi-page and 410 sequences can be scripted). There is
- * no {@code /list} endpoint — every reference table is fed from the stream.
+ * from a FIFO queue (so multi-page and 410 sequences can be scripted). The
+ * stream-fed reference tables have no {@code /list} fallback — the catalogue
+ * {@code /list} pull that also runs per cycle is exercised separately in
+ * {@link CatalogueCaptureTest} and answers the empty map here.
  */
 class ChangeStreamCaptureTest {
 
@@ -39,9 +41,7 @@ class ChangeStreamCaptureTest {
     void setUp() throws Exception {
         conn = TestSupport.openLake();
         st = conn.createStatement();
-        TestSupport.runSqlFile(st, "ollylake/init/V6__reference_tables.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
+        TestSupport.runInitMigrations(st);
 
         http = stub.client();
     }

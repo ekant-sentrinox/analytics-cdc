@@ -20,8 +20,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * WORKSPACE, group via the USERGROUP entityType) — not just users — is
  * populated from the change stream
  * ({@code /cursors} + {@code /changes}), each row stamped with its owning
- * customer_id; there is no {@code /list} snapshot path. Uses the project's
- * actual V6/V7/V8 schema SQL.
+ * customer_id; the stream-fed tables have no {@code /list} snapshot path
+ * (the catalogue {@code /list} pull is a separate tier — see
+ * {@link CatalogueCaptureTest}). Uses the project's actual schema SQL.
  */
 class SccalReferenceSyncCaptureTest {
 
@@ -38,9 +39,7 @@ class SccalReferenceSyncCaptureTest {
         // Stand the catalog up as a plain in-memory db (no DuckLake/MinIO needed).
         conn = TestSupport.openLake();
         st = conn.createStatement();
-        TestSupport.runSqlFile(st, "ollylake/init/V6__reference_tables.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V7__sync_cursor_state.sql");
-        TestSupport.runSqlFile(st, "ollylake/init/V8__entity_change_audit.sql");
+        TestSupport.runInitMigrations(st);
         http = stub.client();
     }
 

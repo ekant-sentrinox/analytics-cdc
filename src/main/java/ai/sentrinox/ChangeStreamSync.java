@@ -60,7 +60,8 @@ final class ChangeStreamSync {
 
     private static final Logger log = LoggerFactory.getLogger(ChangeStreamSync.class);
 
-    private static final String CHANGE_CURSOR_TABLE = "ollylake.main.sccal_change_cursor";
+    /** Also read by {@link CatalogueListSync} to discover the known (customer, tenant) pairs. */
+    static final String CHANGE_CURSOR_TABLE = "ollylake.main.sccal_change_cursor";
     private static final String REGISTRY_CURSOR_TABLE = "ollylake.main.sccal_registry_cursor";
     private static final String AUDIT_TABLE = "ollylake.main.entity_change_audit";
     private static final String ENTRIES_STAGE = SccalReferenceSync.ENTRIES_STAGE;
@@ -77,22 +78,30 @@ final class ChangeStreamSync {
     record TenantCursor(long customerId, long tenantId, long lastChangeId) {
     }
 
-    /** All registry entries with {@code seq >= startOffset}, plus the offset to poll next. */
-    record CursorPage(List<TenantCursor> entries, long nextOffset) {
+    /**
+     * All registry entries with {@code seq >= startOffset}, plus the offset to
+     * poll next and the embedded global-catalog gate revision
+     * ({@code globalCatalog.schemaRevision} — present on every page, including
+     * an idle one; null when the server predates the gate).
+     */
+    record CursorPage(List<TenantCursor> entries, long nextOffset, Long schemaRevision) {
     }
 
-    /** One cycle's running tallies — the merge deltas plus audit rows appended — for the log line. */
-    private static final class Counts {
+    /**
+     * One cycle's running tallies — the merge deltas plus audit rows appended —
+     * for the log line and the commit decision. Shared with
+     * {@link CatalogueListSync} (which never audits).
+     */
+    static final class Counts {
         int inserted;
         int updated;
         int deleted;
         int audited;
 
-        /** Add one sync's {@code {inserted, updated, deleted}} result (the order applyChanges returns). */
-        void addMerge(int[] iud) {
-            inserted += iud[0];
-            updated += iud[1];
-            deleted += iud[2];
+        void addMerge(SccalReferenceSync.MergeCounts merge) {
+            inserted += merge.inserted();
+            updated += merge.updated();
+            deleted += merge.deleted();
         }
 
         /** True once anything was captured this cycle — the signal to commit rather than roll back. */
@@ -121,20 +130,28 @@ final class ChangeStreamSync {
      * One change-stream cycle (see class doc). Pairs are discovered from the
      * registry itself: a reported pair with no saved cursor starts from offset 1
      * (first-contact bootstrap), all others resume from their saved offset.
+     *
+     * @return the global-catalog gate revision embedded in the /cursors page
+     *         ({@code globalCatalog.schemaRevision}) — the catalogue pull
+     *         ({@link CatalogueListSync}) keys off it; null when the server
+     *         does not embed the gate
      */
-    static void run(Connection conn, Statement st, HttpClient http, String baseUrl)
+    static Long run(Connection conn, Statement st, HttpClient http, String baseUrl)
             throws SQLException {
-        Map<String, Long> offsets = readChangeOffsets(st);
         long seqOffset = readRegistryOffset(st);
         CursorPage page = fetchCursors(conn, http, baseUrl, seqOffset);
         List<TenantCursor> advanced = dedupeByPair(page.entries());
         if (advanced.isEmpty()) {
             log.info("change stream: idle (no tenant advanced past seq {})", seqOffset);
-            return;
+            return page.schemaRevision();
         }
 
+        // Read only once a tenant actually advanced — the idle cycle above
+        // must not scan the cursor table.
+        Map<String, Long> offsets = readChangeOffsets(st);
         applyAdvancedTenants(conn, st, http, baseUrl, advanced, offsets, page.nextOffset(),
             page.entries().size() >= PAGE_LIMIT);
+        return page.schemaRevision();
     }
 
     /**
@@ -239,7 +256,7 @@ final class ChangeStreamSync {
      */
     private static int auditStagedEntries(Statement st, TenantCursor c, long minChangeId)
             throws SQLException {
-        long malformed = queryLong(st, "SELECT count(*) FROM " + ENTRIES_STAGE
+        long malformed = SqlScripts.queryLong(st, "SELECT count(*) FROM " + ENTRIES_STAGE
             + " WHERE change_id IS NULL OR entity_type IS NULL OR action IS NULL");
         if (malformed > 0) {
             log.warn("change stream: {} malformed /changes entr(y/ies) for customerId={},"
@@ -326,10 +343,32 @@ final class ChangeStreamSync {
     private static CursorPage fetchCursors(Connection conn, HttpClient http, String baseUrl,
                                            long startOffset) throws SQLException {
         List<TenantCursor> all = new ArrayList<>();
+        // Every page embeds the same (TTL-cached) gate value — keep the last seen.
+        Long[] revision = new Long[1];
         String urlPrefix = baseUrl + SccalReferenceSync.API_PATH + "cursors?";
         long next = pageAll(conn, http, urlPrefix, startOffset, null,
-            body -> all.addAll(parseCursors(conn, body)));
-        return new CursorPage(all, next);
+            body -> {
+                all.addAll(parseCursors(conn, body));
+                Long r = parseGlobalRevision(conn, body);
+                if (r != null) {
+                    revision[0] = r;
+                }
+            });
+        return new CursorPage(all, next, revision[0]);
+    }
+
+    /**
+     * The {@code globalCatalog.schemaRevision} gate embedded in a /cursors page
+     * body; null when absent or malformed (a server predating the gate).
+     */
+    private static Long parseGlobalRevision(Connection conn, String body) throws SQLException {
+        List<Long> values = DuckJson.queryAll(conn,
+            "SELECT TRY_CAST(?::JSON->'globalCatalog'->>'schemaRevision' AS BIGINT)", body,
+            rs -> {
+                long v = rs.getLong(1);
+                return rs.wasNull() ? null : v;
+            });
+        return values.isEmpty() ? null : values.get(0);
     }
 
     /** Consumes one page body of an offset-paged endpoint. */
@@ -407,25 +446,20 @@ final class ChangeStreamSync {
 
     private static void writeChangeOffset(Statement st, long customerId, long tenantId,
                                           long next) throws SQLException {
-        st.execute("DELETE FROM " + CHANGE_CURSOR_TABLE + " WHERE customer_id = " + customerId
-            + " AND tenant_id = " + tenantId);
-        st.execute("INSERT INTO " + CHANGE_CURSOR_TABLE + " VALUES ("
-            + customerId + ", " + tenantId + ", " + next + ")");
+        SqlScripts.replaceRows(st, CHANGE_CURSOR_TABLE,
+            "customer_id = " + customerId + " AND tenant_id = " + tenantId,
+            customerId + ", " + tenantId + ", " + next);
     }
 
     /** Saved /cursors startOffset; 1 when never saved. */
     private static long readRegistryOffset(Statement st) throws SQLException {
-        try (ResultSet rs = st.executeQuery(
-            "SELECT max(next_seq_offset) FROM " + REGISTRY_CURSOR_TABLE)) {
-            rs.next();
-            long v = rs.getLong(1);
-            return (rs.wasNull() || v < 1) ? 1 : v;
-        }
+        Long v = SqlScripts.queryNullableLong(st,
+            "SELECT max(next_seq_offset) FROM " + REGISTRY_CURSOR_TABLE);
+        return (v == null || v < 1) ? 1 : v;
     }
 
     private static void writeRegistryOffset(Statement st, long next) throws SQLException {
-        st.execute("DELETE FROM " + REGISTRY_CURSOR_TABLE);
-        st.execute("INSERT INTO " + REGISTRY_CURSOR_TABLE + " VALUES (" + next + ")");
+        SqlScripts.replaceRows(st, REGISTRY_CURSOR_TABLE, null, String.valueOf(next));
     }
 
     // ---- small helpers ----------------------------------------------------------
@@ -445,14 +479,6 @@ final class ChangeStreamSync {
 
     private static String key(long customerId, long tenantId) {
         return customerId + ":" + tenantId;
-    }
-
-    /** First column of the query's first row as a long; the row must exist. */
-    private static long queryLong(Statement st, String sql) throws SQLException {
-        try (ResultSet rs = st.executeQuery(sql)) {
-            rs.next();
-            return rs.getLong(1);
-        }
     }
 
     private ChangeStreamSync() {

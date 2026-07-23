@@ -47,10 +47,16 @@ is loaded from config via `io.dazzleduck.sql.common.StartupScriptProvider`.
 ```
 
 In one sentence: the SCCAL server is the source of truth → `SccalReferenceSync`
-polls its **entity-change stream** over HTTP (`/cursors` + `/changes` — the only
-two endpoints it uses) → applies each explicit insert/update/delete to the
-DuckLake reference tables → writes them as Parquet in MinIO, tracked by the
-PostgreSQL catalog metadata. There is **no full-snapshot (`/list`) path**.
+polls its **entity-change stream** over HTTP (`/cursors` + `/changes`) →
+applies each explicit insert/update/delete to the DuckLake reference tables →
+writes them as Parquet in MinIO, tracked by the PostgreSQL catalog metadata.
+The stream-fed tables have **no full-snapshot (`/list`) fallback**.
+
+A second, **global tier** runs in the same cycle: the catalogue dimensions
+(providers, models, MCP servers/tools) plus `tenant` are deliberately **not**
+in the change stream — they sync from `GET /…/{objectType}/list` by full
+snapshot on first contact, then **`updatedSince` incremental deltas** with
+`isDeleted` tombstones (see [Catalogue pull](#the-catalogue-list-pull-global-tier)).
 
 ### Inside `SccalReferenceSync` (one run)
 
@@ -96,6 +102,46 @@ captured tables — target table, `/changes` entityType, key/data columns and
 their JSON fields — are declared in one place, the `analytics_cdc.syncs` list in
 `application.conf`.
 
+### The catalogue `/list` pull (global tier)
+
+After the stream phase, the same cycle captures the **global catalog** tables
+(`CatalogueListSync`) — the tier the admin layer's `global-catalog-sync.md`
+excludes from the change stream because its rows only change when a global
+Flyway migration lands upstream:
+
+```
+globalCatalog.schemaRevision              ── embedded in every /cursors page ("the gate")
+        │
+        ├─ unchanged vs V7 sccal_catalogue_revision ──►  skip the /list endpoints entirely
+        │
+        ▼  per catalogue objectType (providercatalogue, modelcatalogue, mcp…)
+GET /internal/sccal/api/v1/{objectType}/list?customerId=…&tenantId=…[&updatedSince=…]
+        │        no saved cursor → full live snapshot; cursor → strict updated_at > since delta
+        ▼
+   JSON map id → {…fields…, isDeleted}   ──►  shred ($.*), soft-DELETE / UPDATE / INSERT
+        │
+        ▼
+   ┌─ one transaction ──────────────────────────────────────────────┐
+   │  merge each catalogue table (declaration = FK order)            │
+   │  advance each pulled type's updatedSince cursor (V7)            │
+   │  store the seen gate revision (V7)                              │
+   │  + snapshot `tenant` for every known (customer, tenant) pair    │
+   └──────────────────────────────────────────────────────────────────┘
+```
+
+- **Gate** — catalogue pulls are skipped while `schemaRevision` (a near-free
+  value riding on the existing `/cursors` poll) matches the stored one; a
+  server that does not embed the gate falls back to pulling every cycle.
+- **Cursor** — the `/list` payload carries no `updatedAt`, so after a
+  non-empty pull the cursor advances to *request start − 60 s* (clock-skew
+  lap) and never moves backwards; the server bound is strict (`>`), the merge
+  idempotent, so the overlap is harmless. An empty delta writes nothing.
+- **Tombstones** — a retired catalogue row arrives as `isDeleted: true` and is
+  soft-deleted (kept, flagged `is_deleted`), same as the stream path.
+- **`tenant`** — its `/list` is snapshot-only upstream (`updatedSince` inert)
+  and answers one row per `(customerId, tenantId)`, so it is re-pulled per
+  pair known to the change stream on every cycle, not gated; replays no-op.
+
 ---
 
 ## What tables we are getting
@@ -116,21 +162,38 @@ context.
 | `llm_access_rule` | `RULE` (ruleType 0/1) | `customer_id, ruleId` | `name` | RULE fans out by the payload's ruleType (`entry_filter` in config) |
 | `mcp_access_rule` | `RULE` (ruleType 2/3) | `customer_id, ruleId` | `name` | RULE fans out by the payload's ruleType (`entry_filter` in config) |
 
-All other V6 tables (`vkey`, `provider`, `mcp_server`, `budget_rule`) have
-**no corresponding `/changes` entity type** and are created but left empty.
-There is no tenant table: the `v_ai_audit` view (V9) serves `tenant_id`
-straight from the audit rows with a NULL `tenant_name`.
+The remaining V6 tables (`vkey`, `budget_rule`) have no source on either
+capture path and are created but left empty.
 
-### Change-stream state and audit tables (V7 / V8)
+### Captured catalogue tables (V6, `/list`-fed)
 
-Written by the change-stream phase, in the same transaction as the data they
-describe:
+Fed from the `/list` pull (see above), declared in `analytics_cdc.catalogue_syncs`.
+The four global lookups are cluster-shared — **no `customer_id`**, not
+partitioned; ids are the source cluster's Snowflake ids copied verbatim, so
+they join to fact data (hence `provider_id BIGINT`). `tenant` is per-customer
+and stamped from the poll context like the stream-fed tables. Per the V6
+philosophy the tables hold id + name (+ the parent-id join key for
+`model`/`mcp_tool`); richer attributes stay in the source of truth.
+
+| V6 table | objectType | Key | Attributes |
+|---|---|---|---|
+| `provider` | `providercatalogue` | `providerCatalogueId` | `name` |
+| `model` | `modelcatalogue` | `modelCatalogueId` | `name`, `provider_id` |
+| `mcp_server` | `mcpservercatalogue` | `mcpServerCatalogueId` | `name` |
+| `mcp_tool` | `mcptoolcatalogue` | `mcpToolCatalogueId` | `name`, `mcp_server_id` |
+| `tenant` | `tenant` (per pair) | `customer_id, tenantId` | `name` (never tombstoned — the endpoint always answers `isDeleted:false`) |
+
+### Sync state and audit tables (V7 / V8)
+
+Written in the same transaction as the data they describe:
 
 | Table | Content |
 |---|---|
 | `sccal_change_cursor` (V7) | per `(customer_id, tenant_id)`: the next `/changes` `startOffset` to pull — equals the endpoint's last `nextOffset` once the stream is consumed |
 | `sccal_registry_cursor` (V7) | singleton: the next `/cursors` `startOffset` for tenant-advance discovery |
 | `entity_change_audit` (V8) | every pulled `/changes` entry verbatim — **all** entity types, even those feeding no reference table (e.g. `ACTIVATION`, `GROUP`, `WORKSPACE`) — with both payload views (`sccal_payload`, `human_payload`) as JSON text |
+| `sccal_catalogue_cursor` (V7) | per catalogue objectType: the `updatedSince` (ISO-8601 UTC) for the next `/list` delta pull |
+| `sccal_catalogue_revision` (V7) | singleton: the last-seen `globalCatalog.schemaRevision` gate value |
 
 ---
 
@@ -145,8 +208,13 @@ analytics_cdc {
   startup_script_provider {
     script_location = "ollylake/startup.sql" # env STARTUP_SQL overrides
   }
-  syncs = [ ... ]                            # the captured tables — see below
-}
+  syncs = [ ... ]                            # stream-fed tables — see below
+  catalogue_syncs = [ ... ]                  # /list-fed catalogue tables (FK order)
+  catalogue_context {                        # customerId/tenantId sent on global
+    customer_id = "1"                        #   catalogue pulls — required by the
+    tenant_id   = "1"                        #   endpoint, inert for global types;
+  }                                          #   env CATALOGUE_CUSTOMER_ID /
+}                                            #   CATALOGUE_TENANT_ID override
 ```
 
 ### Adding a new reference table (config only — no Java change)
@@ -178,6 +246,13 @@ Each column lists its `json_fields` most-specific first; the capture coalesces
 them, taking the first field present in the payload. Declarations are validated
 at startup (identifier shapes, duplicate tables, statement splicing) and a bad
 entry fails fast rather than silently dropping a table from capture.
+
+A **catalogue** (`/list`-fed) table works the same way in
+`analytics_cdc.catalogue_syncs`, with `object_type` (the `/list` path segment,
+lowercase) instead of `entity_type`, and an optional `per_tenant = true` for
+endpoints that answer per `(customerId, tenantId)` pair (see the `tenant`
+entry). Keep the list in referenced-before-referencing (FK) order — entries
+apply in declaration order.
 
 `poll_interval` controls how the CDC runs: a **positive duration** (`30s` — the
 default, `1m`, `5 minutes`) polls — stay alive and re-capture on that interval,

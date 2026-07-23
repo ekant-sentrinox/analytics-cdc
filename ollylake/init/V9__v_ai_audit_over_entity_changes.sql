@@ -14,9 +14,10 @@
 --                   feeds the UI's action filter dropdown
 --   user/workspace id + name — filled only when the changed entity IS a user /
 --                   workspace (conditional dimension joins), NULL otherwise
---   tenant_id     — straight from the audit row; tenant_name is NULL (this
---                   lake has no tenant dimension — no /changes entityType
---                   carries the pair)
+--   tenant_id     — straight from the audit row; tenant_name resolves from
+--                   the V6 tenant dimension (fed by the catalogue /list pull,
+--                   keyed per (customer_id, tenant_id)) — NULL until that
+--                   pair's tenant row has been captured
 --
 -- CREATE OR REPLACE keeps this idempotent for re-runs of ollylake-init.
 -- NOTE: if the analytics-schema migrator's R__ai_audit.sql is ever applied to
@@ -31,7 +32,7 @@ SELECT
     CAST(NULL AS BIGINT)                   AS sgwe_id,
 
     a.tenant_id,
-    CAST(NULL AS VARCHAR)                  AS tenant_name,
+    tn.name                                AS tenant_name,
     a.customer_id,
     CASE WHEN a.entity_type = 'WORKSPACE' THEN a.entity_id END AS workspace_id,
     ws.name                                AS workspace_name,
@@ -50,4 +51,5 @@ SELECT
 FROM ollylake.main.entity_change_audit a
 LEFT JOIN ollylake.main.workspace ws ON a.entity_type = 'WORKSPACE' AND ws.workspace_id = a.entity_id
 LEFT JOIN ollylake.main."user"    u  ON a.entity_type = 'USER'      AND u.user_id       = a.entity_id
-LEFT JOIN ollylake.main."user" changed_user  ON changed_user.user_id = a.changed_by;
+LEFT JOIN ollylake.main."user" changed_user  ON changed_user.user_id = a.changed_by
+LEFT JOIN ollylake.main.tenant tn ON tn.customer_id = a.customer_id AND tn.tenant_id = a.tenant_id;

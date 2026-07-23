@@ -12,7 +12,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -38,25 +42,32 @@ final class TestSupport {
     }
 
     /**
+     * Run every {@code ollylake/init} migration in version order — the same
+     * ordering the production initializer uses, so a new migration is picked
+     * up by every capture test without editing each fixture.
+     */
+    static void runInitMigrations(Statement st) throws Exception {
+        for (java.nio.file.Path file : OllylakeSchemaInitializer.sqlFiles(Paths.get("ollylake/init"))) {
+            runSqlFile(st, file.toString());
+        }
+    }
+
+    /**
      * Run one project SQL file (e.g. an {@code ollylake/init} migration),
      * statement by statement.
      *
-     * <p>DuckLake partitioning syntax is dropped: the plain in-memory catalog
-     * {@link #openLake()} stands up cannot parse or execute it. Partitioning is
-     * a physical-layout concern of the production DuckLake catalog and does not
-     * affect what these correctness tests exercise. Two forms appear in the init
-     * SQL — a standalone {@code ALTER TABLE ... SET PARTITIONED BY (...)}
-     * (dropped whole) and a trailing {@code PARTITION BY (...)} clause on a
-     * {@code CREATE TABLE} (the clause is cut, the table kept).
+     * <p>DuckLake partitioning syntax ({@code ALTER TABLE ... SET PARTITIONED
+     * BY (...)}) is dropped: the plain in-memory catalog {@link #openLake()}
+     * stands up cannot parse or execute it. Partitioning is a physical-layout
+     * concern of the production DuckLake catalog and does not affect what
+     * these correctness tests exercise.
      */
     static void runSqlFile(Statement st, String path) throws Exception {
         for (String stmt : SqlScripts.splitStatements(Files.readString(Paths.get(path)))) {
-            String upper = stmt.toUpperCase(java.util.Locale.ROOT);
-            if (upper.contains("SET PARTITIONED BY")) {
+            if (stmt.toUpperCase(java.util.Locale.ROOT).contains("SET PARTITIONED BY")) {
                 continue;
             }
-            int clause = upper.indexOf("PARTITION BY");
-            st.execute(clause < 0 ? stmt : stmt.substring(0, clause));
+            st.execute(stmt);
         }
     }
 
@@ -66,10 +77,7 @@ final class TestSupport {
 
     /** First column of the query's first row as a long; the row must exist. */
     static long queryLong(Statement st, String sql) throws SQLException {
-        try (ResultSet rs = st.executeQuery(sql)) {
-            rs.next();
-            return rs.getLong(1);
-        }
+        return SqlScripts.queryLong(st, sql);
     }
 
     /** First column of the query's first row as a string; the row must exist. */
@@ -104,20 +112,31 @@ final class TestSupport {
     // ---- SCCAL endpoint stub + JSON page builders (shared by the capture tests) ----
 
     /**
-     * Stub of the two SCCAL endpoints: {@code /cursors} answers from
+     * Stub of the SCCAL endpoints: {@code /cursors} answers from
      * {@link #cursorsJson} (any startOffset); {@code /changes} answers from a
      * FIFO of responses — a String is an HTTP 200 body, an Integer a bare
-     * status. A non-200 {@link #status} fails every endpoint (for
-     * failed-cycle tests).
+     * status; {@code /{objectType}/list} answers from a per-objectType FIFO
+     * ({@link #addListResponse}), defaulting to the empty map {@code "{}"}.
+     * Every request URI is recorded in {@link #requests} so tests can assert
+     * which endpoints were hit and with which query params. A non-200
+     * {@link #status} fails every endpoint (for failed-cycle tests).
      */
     static final class SccalStub {
         String cursorsJson = "{}";
         final Deque<Object> changesResponses = new ArrayDeque<>();
+        final Map<String, Deque<String>> listResponses = new HashMap<>();
+        final List<URI> requests = new ArrayList<>();
         int status = 200;
+
+        /** Queue one /list body for the given objectType. */
+        void addListResponse(String objectType, String body) {
+            listResponses.computeIfAbsent(objectType, k -> new ArrayDeque<>()).add(body);
+        }
 
         HttpClient client() {
             return httpStub(req -> {
                 URI uri = req.uri();
+                requests.add(uri);
                 if (status != 200) {
                     return response(status, "", uri);
                 }
@@ -131,8 +150,14 @@ final class TestSupport {
                         ? response(failure, "", uri)
                         : response(200, (String) next, uri);
                 }
+                if (path.endsWith("/list")) {
+                    String[] segments = path.split("/");
+                    Deque<String> queue = listResponses.get(segments[segments.length - 2]);
+                    String body = (queue == null || queue.isEmpty()) ? "{}" : queue.poll();
+                    return response(200, body, uri);
+                }
                 throw new AssertionError(
-                    "unexpected endpoint (only /cursors and /changes exist): " + path);
+                    "unexpected endpoint (only /cursors, /changes and /list exist): " + path);
             });
         }
     }
@@ -148,6 +173,13 @@ final class TestSupport {
     static String cursorsPage(String entriesCsv, long nextOffset) {
         return "{\"entries\":[" + entriesCsv + "],\"startOffset\":1,\"limit\":1000,\"nextOffset\":"
             + nextOffset + ",\"hasMore\":false}";
+    }
+
+    /** One /cursors page carrying the embedded global-catalog gate revision. */
+    static String cursorsPage(String entriesCsv, long nextOffset, long schemaRevision) {
+        return "{\"entries\":[" + entriesCsv + "],\"startOffset\":1,\"limit\":1000,\"nextOffset\":"
+            + nextOffset + ",\"hasMore\":false,\"globalCatalog\":{\"schemaRevision\":"
+            + schemaRevision + ",\"appliedAt\":\"2026-07-20T00:00:00Z\"}}";
     }
 
     /** One /changes page around the given entry JSONs. */

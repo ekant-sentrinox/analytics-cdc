@@ -46,7 +46,8 @@ public final class OllylakeSchemaInitializer {
         log.info("ollylake tables created.");
     }
 
-    private static List<Path> sqlFiles(Path dir) throws Exception {
+    /** Every {@code .sql} file in {@code dir}, in migration-version order. */
+    static List<Path> sqlFiles(Path dir) throws Exception {
         try (Stream<Path> stream = Files.list(dir)) {
             return stream
                 .filter(p -> p.getFileName().toString().endsWith(".sql"))

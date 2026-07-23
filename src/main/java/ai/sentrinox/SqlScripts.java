@@ -5,13 +5,43 @@ import io.dazzleduck.sql.common.StartupScriptProvider;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Helpers for working with multi-statement SQL scripts. */
+/** Helpers for multi-statement SQL scripts and small shared SQL plumbing. */
 final class SqlScripts {
+
+    /** First column of the query's first row as a long; the row must exist. */
+    static long queryLong(Statement st, String sql) throws SQLException {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    /** Like {@link #queryLong}, but null when the value is SQL NULL (e.g. max() over no rows). */
+    static Long queryNullableLong(Statement st, String sql) throws SQLException {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            rs.next();
+            long v = rs.getLong(1);
+            return rs.wasNull() ? null : v;
+        }
+    }
+
+    /**
+     * Replace the row(s) a cursor-state write targets: DELETE matching
+     * {@code where} (all rows when null — the singleton tables), then INSERT
+     * the literal {@code values} CSV. DuckLake has no upsert; every cursor
+     * table is maintained through this one path.
+     */
+    static void replaceRows(Statement st, String table, String where, String values)
+            throws SQLException {
+        st.execute("DELETE FROM " + table + (where == null ? "" : " WHERE " + where));
+        st.execute("INSERT INTO " + table + " VALUES (" + values + ")");
+    }
 
     /**
      * Open an in-memory DuckDB connection and run the config's startup script —
