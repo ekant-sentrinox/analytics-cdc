@@ -273,10 +273,10 @@ class CatalogueCaptureTest {
         assertEquals(1, TestSupport.count(st, PROVIDER_TABLE));
         assertEquals("acme", tenantName(2));
         assertEquals(3, revision());
-        // The captured tenant dimension resolves tenant_name in v_ai_audit
+        // The captured tenant dimension resolves tenant_name in sal_audit
         // (the view serves the stream's audit rows for the same pair).
         assertEquals("acme", TestSupport.queryString(st,
-            "SELECT tenant_name FROM ollylake.main.v_ai_audit"
+            "SELECT tenant_name FROM ollylake.main.sal_audit"
                 + " WHERE customer_id = 1 AND tenant_id = 2"));
 
         // Second cycle, nothing new anywhere: gate unchanged → no global /list

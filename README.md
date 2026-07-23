@@ -7,11 +7,21 @@ and whose metadata lives in a PostgreSQL catalog database (`metadata-db`):
 
 | Program | Container | Role |
 |---|---|---|
-| `ai.sentrinox.OllylakeSchemaInitializer` | `ollylake-init` | ATTACH the catalog and run the init SQL (`ollylake/init/*.sql`) to **create** the tables. |
+| `ai.sentrinox.OllylakeSchemaInitializer` | `ollylake-init` | ATTACH the catalog and run the init SQL (`schema/ollylake/init/*.sql` from the submodule; override the mount with `OLLYLAKE_INIT_DIR`) to **create** the tables. |
 | `ai.sentrinox.SccalReferenceSync` | `analytics-cdc` | Read the `(customerId, tenantId)` pairs, call the **SCCAL internal-sync API**, and **capture changes** (insert/update/delete) into the reference tables. |
 
-Both share one bootstrap: the startup SQL (extensions + S3 secret + `ATTACH`)
-is loaded from config via `io.dazzleduck.sql.common.StartupScriptProvider`.
+Both share one bootstrap: the startup SQL (extensions + S3 secret + `ATTACH`),
+`schema/ollylake/conf/connect.sql`, is loaded from config via
+`io.dazzleduck.sql.common.StartupScriptProvider`.
+
+The **`schema/` directory is a git submodule** pinning the
+[analytics-schema](https://github.com/Sentrinox/analytics-schema) repo — it
+provides the init migrations, the `connect.sql` bootstrap and the schema this
+project builds against. A plain clone leaves it empty; after cloning run:
+
+```bash
+git submodule update --init          # or: git clone --recurse-submodules <url>
+```
 
 ---
 
@@ -42,7 +52,7 @@ is loaded from config via `io.dazzleduck.sql.common.StartupScriptProvider`.
                           │                                │
                           │  metadata → PostgreSQL         │
                           │  data     → Parquet in MinIO   │
-                          │             (s3://ollylake/)   │
+                          │           (s3://ollylake-cdc/) │
                           └────────────────────────────────┘
 ```
 
@@ -63,14 +73,14 @@ snapshot on first contact, then **`updatedSince` incremental deltas** with
 Every reference table is fed from the change stream (`ChangeStreamSync`):
 
 ```
-saved registry offset (V7 sccal_registry_cursor)
+saved registry offset (V15 sccal_registry_cursor)
         │
         ▼
 GET /internal/sccal/api/v1/cursors?startOffset=…      ── "which tenants advanced?"
         │
         ├─ empty page ──►  idle: cycle over, nothing fetched, nothing written
         │
-        ▼  per advanced (customerId, tenantId), from its V7 sccal_change_cursor offset
+        ▼  per advanced (customerId, tenantId), from its V15 sccal_change_cursor offset
 GET /internal/sccal/api/v1/changes?…&startOffset=…&view=BOTH   ── paged entity_change entries
         │
         ▼
@@ -78,7 +88,7 @@ GET /internal/sccal/api/v1/changes?…&startOffset=…&view=BOTH   ── paged 
         │
         ▼
    ┌─ one transaction ─────────────────────────────────────────┐
-   │  append EVERY entry to entity_change_audit (V8 audit log,  │
+   │  append EVERY entry to entity_change_audit (V16 audit log, │
    │    all entity types, sccal + human payloads)               │
    │  DELETE rows with action = 'DELETE' (explicit tombstones)  │
    │  UPDATE / INSERT the rest                                  │
@@ -112,7 +122,7 @@ Flyway migration lands upstream:
 ```
 globalCatalog.schemaRevision              ── embedded in every /cursors page ("the gate")
         │
-        ├─ unchanged vs V7 sccal_catalogue_revision ──►  skip the /list endpoints entirely
+        ├─ unchanged vs V15 sccal_catalogue_revision ──►  skip the /list endpoints entirely
         │
         ▼  per catalogue objectType (providercatalogue, modelcatalogue, mcp…)
 GET /internal/sccal/api/v1/{objectType}/list?customerId=…&tenantId=…[&updatedSince=…]
@@ -123,8 +133,8 @@ GET /internal/sccal/api/v1/{objectType}/list?customerId=…&tenantId=…[&update
         ▼
    ┌─ one transaction ──────────────────────────────────────────────┐
    │  merge each catalogue table (declaration = FK order)            │
-   │  advance each pulled type's updatedSince cursor (V7)            │
-   │  store the seen gate revision (V7)                              │
+   │  advance each pulled type's updatedSince cursor (V15)           │
+   │  store the seen gate revision (V15)                             │
    │  + snapshot `tenant` for every known (customer, tenant) pair    │
    └──────────────────────────────────────────────────────────────────┘
 ```
@@ -183,17 +193,17 @@ philosophy the tables hold id + name (+ the parent-id join key for
 | `mcp_tool` | `mcptoolcatalogue` | `mcpToolCatalogueId` | `name`, `mcp_server_id` |
 | `tenant` | `tenant` (per pair) | `customer_id, tenantId` | `name` (never tombstoned — the endpoint always answers `isDeleted:false`) |
 
-### Sync state and audit tables (V7 / V8)
+### Sync state and audit tables (V15 / V16)
 
 Written in the same transaction as the data they describe:
 
 | Table | Content |
 |---|---|
-| `sccal_change_cursor` (V7) | per `(customer_id, tenant_id)`: the next `/changes` `startOffset` to pull — equals the endpoint's last `nextOffset` once the stream is consumed |
-| `sccal_registry_cursor` (V7) | singleton: the next `/cursors` `startOffset` for tenant-advance discovery |
-| `entity_change_audit` (V8) | every pulled `/changes` entry verbatim — **all** entity types, even those feeding no reference table (e.g. `ACTIVATION`, `GROUP`, `WORKSPACE`) — with both payload views (`sccal_payload`, `human_payload`) as JSON text |
-| `sccal_catalogue_cursor` (V7) | per catalogue objectType: the `updatedSince` (ISO-8601 UTC) for the next `/list` delta pull |
-| `sccal_catalogue_revision` (V7) | singleton: the last-seen `globalCatalog.schemaRevision` gate value |
+| `sccal_change_cursor` (V15) | per `(customer_id, tenant_id)`: the next `/changes` `startOffset` to pull — equals the endpoint's last `nextOffset` once the stream is consumed |
+| `sccal_registry_cursor` (V15) | singleton: the next `/cursors` `startOffset` for tenant-advance discovery |
+| `entity_change_audit` (V16) | every pulled `/changes` entry verbatim — **all** entity types, even those feeding no reference table (e.g. `ACTIVATION`, `GROUP`, `WORKSPACE`) — with both payload views (`sccal_payload`, `human_payload`) as JSON text |
+| `sccal_catalogue_cursor` (V15) | per catalogue objectType: the `updatedSince` (ISO-8601 UTC) for the next `/list` delta pull |
+| `sccal_catalogue_revision` (V15) | singleton: the last-seen `globalCatalog.schemaRevision` gate value |
 
 ---
 
@@ -206,7 +216,7 @@ analytics_cdc {
   sccal_base_url = "http://localhost:8080"   # env SCCAL_BASE_URL overrides
   poll_interval  = 30s                       # env POLL_INTERVAL overrides
   startup_script_provider {
-    script_location = "ollylake/startup.sql" # env STARTUP_SQL overrides
+    script_location = "schema/ollylake/conf/connect.sql" # env STARTUP_SQL overrides
   }
   syncs = [ ... ]                            # stream-fed tables — see below
   catalogue_syncs = [ ... ]                  # /list-fed catalogue tables (FK order)
@@ -223,8 +233,10 @@ The captured tables are declared in the `analytics_cdc.syncs` list. To capture a
 new table:
 
 1. **Create the table** — add a `CREATE TABLE` to a new `ollylake/init/V*.sql`
-   migration (include `customer_id BIGINT NOT NULL` and partition by it, like
-   the existing V6 tables).
+   migration **in the analytics-schema repo** (the CDC migrations live in its
+   chain; include `customer_id BIGINT NOT NULL` and partition by it, like the
+   existing V6/V14 tables), then bump the `schema/` submodule pin here so
+   `ollylake-init` picks it up.
 2. **Declare the sync** — add one block to `analytics_cdc.syncs`:
 
 ```hocon
@@ -260,12 +272,13 @@ reusing the warm DuckDB connection; cycles that change nothing are rolled back
 (no empty snapshot) and a failed cycle is logged and retried on the next tick.
 **`0`** (or negative) runs one capture and exits.
 
-`ollylake/startup.sql` holds the bootstrap SQL (INSTALL/LOAD
-`ducklake`+`httpfs`+`postgres`, `CREATE SECRET`, `ATTACH`, `USE`). It uses
-`${ENV_VAR}` placeholders resolved by `StartupScriptProvider` — **all must be
-set**: `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `S3_ENDPOINT`, `OLLYLAKE_BUCKET`,
-`METADATA_DB_HOST`, `METADATA_DB_PORT`, `METADATA_DB_NAME`, `METADATA_DB_USER`,
-`METADATA_DB_PASSWORD`.
+`schema/ollylake/conf/connect.sql` (from the analytics-schema submodule) holds
+the bootstrap SQL (INSTALL/LOAD `ducklake`+`httpfs`+`postgres_scanner`+`arrow`,
+`CREATE SECRET`, `ATTACH`, connection-pool tuning). It uses `${ENV_VAR}`
+placeholders resolved by `StartupScriptProvider` — **all must be set**:
+`MINIO_KEY_ID`, `MINIO_SECRET`, `MINIO_REGION`, `MINIO_ENDPOINT`,
+`MINIO_USE_SSL`, `OLLYLAKE_BUCKET`, `PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`,
+`PG_PASSWORD`.
 
 ---
 
@@ -273,9 +286,12 @@ set**: `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `S3_ENDPOINT`, `OLLYLAKE_BUCKET
 
 > The SCCAL Spring server must already be running on the host at `:8080`. The
 > CDC container reaches it via `host.docker.internal:8080` (wired in compose).
+> The `schema/` submodule must be checked out (`git submodule update --init`) —
+> compose mounts `connect.sql` and the init migrations from it.
 
 ```bash
-# Build + start the full chain: minio → minio-init → ollylake-init → analytics-cdc
+# Build + start the full chain:
+#   minio + metadata-db → minio-init → ollylake-init → analytics-cdc
 docker compose up --build
 
 # One-shot capture instead of the default 30s poll loop

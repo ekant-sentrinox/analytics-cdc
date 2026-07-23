@@ -42,12 +42,19 @@ final class TestSupport {
     }
 
     /**
-     * Run every {@code ollylake/init} migration in version order — the same
+     * Run every ollylake init migration in version order — the same
      * ordering the production initializer uses, so a new migration is picked
      * up by every capture test without editing each fixture.
+     *
+     * <p>The init SQL lives in the analytics-schema repo (the CDC migrations
+     * merged into its {@code ollylake/init} chain), vendored here as the
+     * {@code schema/} submodule. {@code OLLYLAKE_INIT_DIR} overrides the
+     * directory (e.g. to test against an external checkout).
      */
     static void runInitMigrations(Statement st) throws Exception {
-        for (java.nio.file.Path file : OllylakeSchemaInitializer.sqlFiles(Paths.get("ollylake/init"))) {
+        String initDir = System.getenv()
+            .getOrDefault("OLLYLAKE_INIT_DIR", "schema/ollylake/init");
+        for (java.nio.file.Path file : OllylakeSchemaInitializer.sqlFiles(Paths.get(initDir))) {
             runSqlFile(st, file.toString());
         }
     }
@@ -56,15 +63,16 @@ final class TestSupport {
      * Run one project SQL file (e.g. an {@code ollylake/init} migration),
      * statement by statement.
      *
-     * <p>DuckLake partitioning syntax ({@code ALTER TABLE ... SET PARTITIONED
-     * BY (...)}) is dropped: the plain in-memory catalog {@link #openLake()}
-     * stands up cannot parse or execute it. Partitioning is a physical-layout
-     * concern of the production DuckLake catalog and does not affect what
-     * these correctness tests exercise.
+     * <p>DuckLake physical-layout syntax ({@code ALTER TABLE ... SET
+     * PARTITIONED BY (...)} / {@code SET SORTED BY (...)}) is dropped: the
+     * plain in-memory catalog {@link #openLake()} stands up cannot parse or
+     * execute it. Layout is a concern of the production DuckLake catalog and
+     * does not affect what these correctness tests exercise.
      */
     static void runSqlFile(Statement st, String path) throws Exception {
         for (String stmt : SqlScripts.splitStatements(Files.readString(Paths.get(path)))) {
-            if (stmt.toUpperCase(java.util.Locale.ROOT).contains("SET PARTITIONED BY")) {
+            String upper = stmt.toUpperCase(java.util.Locale.ROOT);
+            if (upper.contains("SET PARTITIONED BY") || upper.contains("SET SORTED BY")) {
                 continue;
             }
             st.execute(stmt);

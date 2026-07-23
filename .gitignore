@@ -43,3 +43,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+
+# Machine-local compose overrides (e.g. OLLYLAKE_INIT_DIR)
+.env
